@@ -25,7 +25,16 @@ En övningsapp för piano som körs i webbläsaren, gjord för iPad på notstäl
 - Nya toner: det nya ljudet (jämfört med de senaste 90–180 ms) letas igenom en ton i taget; en ton godkänns bara om den
   blivit tydligt starkare i grundtonen och i de flesta av sina deltoner samtidigt (en svävning i ett ostämt piano rör
   deltonerna i otakt och räknas inte).
-- Omslag av en ton som redan klingar: ett kort fönster hör själva anslaget (bredbandig "smäll"), och tonens deltoner
-  jämförs före och efter. Övertoner, grannhalvtoner och appens eget ackompanjemang räknas bort.
-- `dev/test_wait.js` simulerar vänta-läget mot ett syntetiskt piano och mäter hur ofta händelser godkänns utan spel,
-  fastnar eller godkänns på fel ton: `MIDI=låt.mid HAND=L node dev/test_wait.js`.
+- Omslag av en ton som redan klingar: ett kort fönster hör själva anslaget (bredbandig "smäll"), tonens deltoner
+  jämförs före och efter, och de måste ha ändrats plötsligt (ett "ryck" på 43 ms) – svävning och utklingning är
+  långsamma. Varje smäll bedöms för sig, så appens eget anslag strax före spelarens hindrar inte bedömningen.
+  Övertoner, grannhalvtoner och appens eget ljud (vars deltoner är kända) räknas bort.
+- Stämning: appen lär sig varje tangents avvikelse medan man spelar och låter hela stämningen följa medianen.
+  Väntade tangenter som inte lärts in ännu söks med bredare band (±75 cent). Det inlärda sparas på enheten.
+- Tid: en ton som spelats upp till 0,6 s innan musiken nått den räknas ändå, och när en händelse klaras hoppar
+  musiken fram lika mycket som igenkänningen fördröjde – den som spelar i takt hamnar inte "för tidigt".
+- `dev/test_wait.js` simulerar vänta-läget mot ett syntetiskt piano (ostämt, svävande, med appens synt som
+  ackompanjemang) och mäter händelser som godkänns utan spel, som kräver ett andra anslag, som fastnar och som godkänns
+  på fel ton: `MIDI=låt.mid HAND=L node dev/test_wait.js`. Varianter: `EARLY=0.3` (spelaren ligger 0,3 s före appen),
+  `KEYDEV=20 GLOBAL=-40 TUNE=0` (ostämt piano utan "Stäm av"), `BEAT=8` (svävning), `WRONG=1` (fel ton först),
+  `ACC_GAIN=2.5` (högt ackompanjemang), `DEBUG=4|5` (spårning av kandidater respektive omslagsbedömningar).

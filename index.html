@@ -225,8 +225,9 @@
     <h3>2. Låt iPaden lyssna</h3>
     <ol>
       <li>Ställ iPaden på notstället och tryck <b>Starta mikrofonen</b>. Tillåt mikrofonen när iPaden frågar.</li>
-      <li>Tryck <b>Stäm av</b> och spela A:et ovanför mitt-C några gånger. Då lär sig appen hur ditt piano är stämt,
-        så det gör inget att det är lite ostämt.</li>
+      <li>Appen lär sig hur ditt piano är stämt medan du spelar, tangent för tangent, så det gör inget att det är
+        lite ostämt. Är pianot mycket lågt stämt kan du hjälpa den på traven: tryck <b>Stäm av</b> och spela A:et
+        ovanför mitt-C några gånger.</li>
       <li>Hör appen fel? Ändra <b>Känslighet</b> under Stäm av.</li>
     </ol>
 
@@ -255,7 +256,8 @@
       <input type="range" id="sens" min="0" max="100" step="5" aria-label="Känslighet">
       <span class="muted" id="sensVal"></span>
     </div>
-    <p class="muted">Högre känslighet hör svaga toner bättre men tar oftare fel. Sparad stämning: <span id="tuneSaved"></span></p>
+    <p class="muted">Högre känslighet hör svaga toner bättre men tar oftare fel. Sparad stämning: <span id="tuneSaved"></span>.
+      Sparar du en ny stämning här börjar appen om med att lära sig tangenterna.</p>
     <div class="foot">
       <button class="btn" id="tuneReset">Nollställ</button>
       <button class="btn" id="tuneCancel">Stäng</button>

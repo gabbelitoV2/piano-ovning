@@ -7,6 +7,8 @@
   const LOOK = 3.4;              // så många sekunder framåt syns
   const CHORD_TOL = 0.03;
   const MIC_LATENCY = 0.15;      // ungefärlig fördröjning i tonigenkänningen (s)
+  const PRE_WINDOW = 0.6;        // en ton som spelats så här långt (s) innan musiken nått den räknas ändå
+  const PRESS_KEEP = 0.15;       // tryck yngre än så (s) följer med till nästa händelse när en händelse klaras
   const NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'G#', 'A', 'Bb', 'B'];
   const BLACK = new Set([1, 3, 6, 8, 10]);
   const isBlack = p => BLACK.has(p % 12);
@@ -17,7 +19,7 @@
 
   // ---------- Inställningar ----------
   const S = { hand: 'R', mode: 'wait', tempo: 0.7, section: 0, loop: true, fingers: true, names: false,
-    sound: 'on', accomp: true, sens: 0.5, tune: 0 };
+    sound: 'on', accomp: true, sens: 0.5, tune: 0, keyOff: {} };
   try { Object.assign(S, JSON.parse(localStorage.getItem('po-settings') || '{}')); } catch (e) { /* ingen lagring */ }
   function saveSettings() { try { localStorage.setItem('po-settings', JSON.stringify(S)); } catch (e) { /* ok */ } }
 
@@ -210,6 +212,8 @@
       const det = new PianoDetector.PitchDetector(ac.sampleRate);
       det.setRange(LOW - 5, HIGH + 5);
       det.setTune(S.tune);
+      det.setKeyOffsets(S.keyOff);
+      det.onLearn = onLearned;
       det.sensitivity = S.sens;
       const src = ac.createMediaStreamSource(stream);
       const an = ac.createAnalyser();
@@ -263,9 +267,21 @@
     if (S.mode === 'listen') return;
     for (const o of onsets) {
       if (now - appPlayed[o.p] < 400) continue;          // iPadens eget ljud
-      userNoteOn(o.p, 'mic');
+      userNoteOn(o.p, 'mic', o.restrike ? 0.45 : MIC_LATENCY);   // ett omslag hörs ca 0,45 s efter anslaget
       setTimeout(() => userNoteOff(o.p, 'mic'), 260);
     }
+  }
+  // Detektorn har lärt sig mer om pianots stämning: spara det till nästa gång.
+  let learnTimer = 0;
+  function onLearned() {
+    clearTimeout(learnTimer);
+    learnTimer = setTimeout(() => {
+      if (!mic.det) return;
+      S.tune = Math.round(mic.det.tune * 10) / 10;
+      S.keyOff = mic.det.getKeyOffsets();
+      saveSettings();
+      if (tuneDlg.open) showSaved();
+    }, 1500);
   }
 
   // ---------- USB-klaviatur (Web MIDI, där det finns) ----------
@@ -380,18 +396,27 @@
     if (missing.length !== 1) return false;
     return ev.pitches.size >= 3 || [...ev.got].some(q => Math.abs(q - missing[0]) % 12 === 0);
   }
-  function completeEvent(ev, skipped) {
+  // `lat` = ungefär så många sekunder innan den hördes slogs tonen an (tonigenkänningens fördröjning)
+  function completeEvent(ev, skipped, lat) {
+    const now = performance.now();
     ev.notes.forEach(n => { n.hit = !skipped; });
     if (!skipped) score.ok += ev.pitches.size;
-    if (!skipped && mic.det) for (const p of ev.pitches) mic.det.markPlayed(p, performance.now());   // även toner som inte hördes klingar nu
+    if (!skipped && mic.det) for (const p of ev.pitches) mic.det.markPlayed(p, now);   // även toner som inte hördes klingar nu
+    // musiken stod stilla medan tonen hördes: hoppa fram lika mycket, annars kommer nästa ton "för tidigt"
+    // för den som spelar i takt
+    if (waiting && lat > 0) {
+      const next = practice[pendIdx + 1];
+      t = Math.min(ev.t + lat * S.tempo, next ? Math.max(ev.t, next.t - 1e-3) : ev.t);
+    }
     pendIdx++;
     waiting = false;
-    for (let p = 0; p < 128; p++) consumed[p] = pressId[p];   // gamla tryck får inte följa med till nästa händelse
+    // gamla tryck får inte följa med till nästa händelse – men ett alldeles nytt kan vara nästa ton, spelad i takt
+    for (let p = 0; p < 128; p++) if (ev.pitches.has(p) || now - pressTime[p] > PRESS_KEEP * 1000) consumed[p] = pressId[p];
   }
   function arriveAt(ev) {
     const now = performance.now();
     for (const p of ev.pitches) {
-      if (pressId[p] > consumed[p] && now - pressTime[p] < 350) { ev.got.add(p); consumed[p] = pressId[p]; }
+      if (pressId[p] > consumed[p] && now - pressTime[p] < PRE_WINDOW * 1000) { ev.got.add(p); consumed[p] = pressId[p]; }
     }
     if (satisfied(ev)) completeEvent(ev);
     else waiting = true;
@@ -427,7 +452,7 @@
 
   // ---------- Det du spelar ----------
   const userVoices = new Map();
-  function userNoteOn(p, src) {
+  function userNoteOn(p, src, lat) {
     const now = performance.now();
     pressed.set(p, { wrong: false, src });
     pressTime[p] = now;
@@ -439,7 +464,7 @@
       if (waiting && ev) {
         if (ev.pitches.has(p)) {
           ev.got.add(p); consumed[p] = pressId[p];
-          if (satisfied(ev)) completeEvent(ev);
+          if (satisfied(ev)) completeEvent(ev, false, lat || 0);
         } else if (countWrong && ![...active].some(n => n.p === p && practiced(n.h))) {
           score.bad++; pressed.get(p).wrong = true;
         }
@@ -676,7 +701,10 @@
     if (Math.abs(r) <= 3) return 'Ditt piano är rent stämt.';
     return `Ditt piano är ${Math.abs(r)} cent ${r < 0 ? 'lågt' : 'högt'} stämt.` + (Math.abs(r) > 60 ? ' Det är mycket – spelade du verkligen A4?' : '');
   }
-  function showSaved() { $('tuneSaved').textContent = (S.tune > 0 ? '+' : '') + S.tune + ' cent'; }
+  function showSaved() {
+    const n = Object.keys(S.keyOff || {}).length, r = Math.round(S.tune);
+    $('tuneSaved').textContent = (r > 0 ? '+' : '') + r + ' cent' + (n ? ` (${n} tangenter inlärda medan du spelat)` : '');
+  }
   function tuneTick() {
     const det = mic.det;
     const pk = det.peak(400, 482);
@@ -702,15 +730,18 @@
     tuneDlg.showModal();
     if (!(await startMic())) $('tuneInfo').textContent = 'Mikrofonen behövs för att stämma av.';
   });
-  $('tuneSave').addEventListener('click', () => {
-    S.tune = Math.round(+tuneDlg.dataset.med || 0);
-    if (mic.det) mic.det.setTune(S.tune);
+  function applyTune(cents) {
+    S.tune = cents; S.keyOff = {};
+    if (mic.det) { mic.det.setTune(cents); mic.det.resetKeys(); }   // tangenterna lärs in på nytt utifrån den här stämningen
     saveSettings(); showSaved();
+  }
+  $('tuneSave').addEventListener('click', () => {
+    applyTune(Math.round(+tuneDlg.dataset.med || 0));
     toast('Stämningen sparad: ' + centsText(S.tune));
     tuneDlg.close();
   });
   $('tuneReset').addEventListener('click', () => {
-    S.tune = 0; if (mic.det) mic.det.setTune(0); saveSettings(); showSaved(); tuneVals = [];
+    applyTune(0); tuneVals = [];
     $('tuneNow').textContent = '–'; $('tuneSave').disabled = true;
   });
   $('tuneCancel').addEventListener('click', () => tuneDlg.close());
