@@ -159,9 +159,10 @@
       const g2 = ac.createGain(); g2.gain.value = 0.28;
       o1.connect(lp); o2.connect(g2); g2.connect(lp); lp.connect(g); g.connect(master);
       const decay = Math.max(0.5, 2.6 - (p - 36) / 60 * 1.9);
+      // mjuk ansats (60 ms): då låter iPadens eget ljud sällan som ett tangentanslag för mikrofonen
       g.gain.setValueAtTime(0, now);
-      g.gain.linearRampToValueAtTime(amp, now + 0.006);
-      g.gain.setTargetAtTime(amp * 0.4, now + 0.006, 0.22);
+      g.gain.linearRampToValueAtTime(amp, now + 0.06);
+      g.gain.setTargetAtTime(amp * 0.4, now + 0.06, 0.22);
       g.gain.setTargetAtTime(0.0001, now + 0.35, decay);
       o1.start(now); o2.start(now); o1.stop(now + 14); o2.stop(now + 14);
       const v = { g, oscs: [o1, o2], released: false };
@@ -254,7 +255,9 @@
     if (!mic.on || now - mic.lastRun < 45) return;
     mic.lastRun = now;
     mic.an.getFloatTimeDomainData(mic.buf);
-    const onsets = mic.det.analyze(mic.buf, now, expectedSet());
+    const own = new Set();
+    for (let p = 0; p < 128; p++) if (now - appPlayed[p] < 500) own.add(p);   // det iPaden själv spelar just nu
+    const onsets = mic.det.analyze(mic.buf, now, expectedSet(), own);
     $('micLevel').style.width = Math.max(0, Math.min(100, (mic.det.level + 70) * 1.8)) + '%';
     if (tuneDlg.open) tuneTick();
     if (S.mode === 'listen') return;
@@ -302,7 +305,11 @@
 
   function noteStart(n) {
     const audible = S.sound === 'on' && (S.mode === 'listen' || (!practiced(n.h) && S.accomp));
-    if (audible) { n._voice = synth.noteOn(n.p, n.v); appPlayed[n.p] = performance.now(); }
+    if (audible) {
+      n._voice = synth.noteOn(n.p, n.v);
+      appPlayed[n.p] = performance.now();
+      if (mic.det) mic.det.markOwnOnset(performance.now(), n.p);   // iPadens eget anslag får inte bevisa ett omslag av en släkt ton
+    }
     active.add(n);
   }
   function noteEnd(n) {
@@ -376,13 +383,15 @@
   function completeEvent(ev, skipped) {
     ev.notes.forEach(n => { n.hit = !skipped; });
     if (!skipped) score.ok += ev.pitches.size;
+    if (!skipped && mic.det) for (const p of ev.pitches) mic.det.markPlayed(p, performance.now());   // även toner som inte hördes klingar nu
     pendIdx++;
     waiting = false;
+    for (let p = 0; p < 128; p++) consumed[p] = pressId[p];   // gamla tryck får inte följa med till nästa händelse
   }
   function arriveAt(ev) {
     const now = performance.now();
     for (const p of ev.pitches) {
-      if (pressId[p] > consumed[p] && now - pressTime[p] < 450) { ev.got.add(p); consumed[p] = pressId[p]; }
+      if (pressId[p] > consumed[p] && now - pressTime[p] < 350) { ev.got.add(p); consumed[p] = pressId[p]; }
     }
     if (satisfied(ev)) completeEvent(ev);
     else waiting = true;

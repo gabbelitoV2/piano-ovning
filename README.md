@@ -19,3 +19,13 @@ En övningsapp för piano som körs i webbläsaren, gjord för iPad på notstäl
 | `midi.js` | Läser MIDI-filer och delar upp höger/vänster hand |
 | `fingering.js` | Räknar ut fingersättning (dynamisk programmering, avståndsregler enligt Parncutt m.fl. 1997) |
 | `detector.js` | Hör vilka tangenter som slås an, ur mikrofonljud |
+
+## Tonigenkänning i korthet
+
+- Nya toner: det nya ljudet (jämfört med de senaste 90–180 ms) letas igenom en ton i taget; en ton godkänns bara om den
+  blivit tydligt starkare i grundtonen och i de flesta av sina deltoner samtidigt (en svävning i ett ostämt piano rör
+  deltonerna i otakt och räknas inte).
+- Omslag av en ton som redan klingar: ett kort fönster hör själva anslaget (bredbandig "smäll"), och tonens deltoner
+  jämförs före och efter. Övertoner, grannhalvtoner och appens eget ackompanjemang räknas bort.
+- `dev/test_wait.js` simulerar vänta-läget mot ett syntetiskt piano och mäter hur ofta händelser godkänns utan spel,
+  fastnar eller godkänns på fel ton: `MIDI=låt.mid HAND=L node dev/test_wait.js`.
