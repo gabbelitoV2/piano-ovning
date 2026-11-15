@@ -9,10 +9,15 @@
 //
 // Omslag: en tangent som slås om medan tonen fortfarande klingar blir inte nödvändigtvis starkare (den nya
 // svängningen läggs till den gamla med slumpmässig fas). Det som alltid finns är själva anslaget: en
-// plötslig förändring. Därför mäts anslag i korta rutor (43 ms) som bredbandig "smäll" 1–8 kHz, och när
-// en smäll hörts jämförs varje väntad, klingande tons deltoner i den långa rutan före smällen med dem
-// i den första långa rutan helt efter – ett steg som är klart större än tonens egen långsamma drift
-// räknas som omslag. Det tar ca 0,4 s, vilket är fullt tillräckligt i vänta-läget.
+// plötslig förändring. Därför mäts anslag i korta rutor (43 ms) som bredbandig "smäll" 1–8 kHz. Varje smäll
+// bedöms för sig: för varje väntad, klingande tangent mäts om det kommit en NY SVÄNGNING i dess deltoner
+// (_cnov: varje delton förutsägs ur de två korta rutorna före, och felet mäts mot deltonens styrka – det
+// fungerar oberoende av fas). Bedömningen görs ca 0,4 s efter smällen, när den långa rutan ligger helt efter
+// anslaget och det går att se att ingen granntangent slogs an i stället.
+//
+// Appens eget ljud (ackompanjemanget ur iPadens högtalare) hörs också av mikrofonen. Synten har bara
+// deltonerna 1, 2, 3 och 5, så de band där den ligger räknas bort delton för delton – både när nya toner
+// letas och när omslag bedöms.
 //
 // Stämningen (cent) justerar alla förväntade frekvenser och varje ton får avvika lite (tolerans),
 // så ett lite ostämt piano fungerar. Dessutom lär sig detektorn pianot medan man spelar: varje väntad ton
@@ -54,8 +59,9 @@
   const BASE_FROM = 2, BASE_TO = 4;
   const RING = 12;                    // sparade långa spektrum (ca 0,55 s), även för före/efter-jämförelsen
   const MAX_NOTES = 10;
-  const S_FRAMES = 5;                 // korta rutor per analys (nyast först)
+  const S_FRAMES = 7;                 // korta rutor per analys (nyast först)
   const HARM = [12, 19, 24, 28, 31, 34, 36, 38, 40];   // halvtonsavstånd till deltonerna 2–10
+  const NEAR = [-2, -1, 1, 2];                          // granntangenter som kan förväxlas med en tangent
   const OWN_PARTIALS = new Set([1, 2, 3, 5]);           // deltoner med hörbar styrka i appens eget ljud (triangelvåg + sinus på dubbla frekvensen)
 
   class PitchDetector {
@@ -85,8 +91,11 @@
       for (let i = 0; i < this.sN; i++) this.swin[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (this.sN - 1));
       this.sSpec = [];
       for (let j = 0; j < S_FRAMES; j++) this.sSpec.push(new Float32Array(this.sN / 2));
+      this.sRe = []; this.sIm = [];   // samma rutor med fas (för att höra en ny svängning även när styrkan inte ändras)
+      for (let j = 0; j < S_FRAMES; j++) { this.sRe.push(new Float32Array(this.sN / 2)); this.sIm.push(new Float32Array(this.sN / 2)); }
       this.thumpRatio = 0.3;      // flux (1–8 kHz) som krävs för att räknas som ett anslag
       this.lastThump = -1e9;
+      this.lastSoftThump = -1e9;
       this.lastThumpRatio = 0;
       this.ignoreThumpUntil = -1e9;   // (äldre sätt) appen kan be att smällar ignoreras en stund
       this.ownOnsets = [];            // appens egna anslag {t, p}: en smäll samtidigt med ett sådant får inte
@@ -132,7 +141,7 @@
     // Inlärda tangenter som {tangent: cent}, för att sparas mellan gångerna – och läsas tillbaka.
     getKeyOffsets() {
       const o = {};
-      for (let p = 0; p < 128; p++) if (this.keyConf[p] >= 1) o[p] = Math.round(this.keyOff[p] * 10) / 10;
+      for (let p = 0; p < 128; p++) if (this.keyConf[p] >= 2) o[p] = Math.round(this.keyOff[p] * 10) / 10;   // mätt minst två gånger
       return o;
     }
     setKeyOffsets(o) {
@@ -275,7 +284,7 @@
       if (edge && !allowEdge) return null;
       const a = spec[km - 1], b = spec[km], c = spec[km + 1], den = a - 2 * b + c;
       const shift = edge ? 0 : den < 0 ? Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / den)) : 0;
-      return { f: (km + shift) * sr / N / h, snr: spec[km] / (sum / (k1 - k0 + 1) + 1e-12) };
+      return { f: (km + shift) * sr / N / h, snr: spec[km] / (sum / (k1 - k0 + 1) + 1e-12), j };
     }
 
     // Vilken tangent ligger toppen av det nya ljudet närmast, inom ±1,5 halvton runt tonens grundton?
@@ -296,29 +305,41 @@
       return best;
     }
 
+    // Styrkan i tangentens två första deltoner.
+    _fundAmp(spec, q) {
+      const bd = this.bands[q];
+      if (!bd || bd.length < 2) return [0, 0];
+      return [PitchDetector._bandPeak(spec, bd[0].a, bd[0].b), PitchDetector._bandPeak(spec, bd[1].a, bd[1].b)];
+    }
+
     // Lär in hur tangenten p verkligen är stämd, ur spektrumet `spec` (en ton som nyss hörts och klingar).
     _learn(spec, p) {
       if (!this.bands[p]) return false;
-      if (this.ownOnsets.some(o => PitchDetector._related(p, o.p))) return false;   // appens eget ljud kan ligga i bandet
       const pk = this._fundPeak(spec, p, this.wideCents);
       if (!pk || pk.snr < 4) return false;
+      // ligger en delton av appens eget ljud (rent stämt) i just det band som mäts är mätningen värdelös
+      const own = new Set(this.ownOnsets.map(o => o.p));
+      if (own.size) { const m = this._ownMask(p, own, true); if (m && m.has(pk.j)) return false; }
       const cents = Math.max(-this.wideCents, Math.min(this.wideCents, 1200 * Math.log2(pk.f / this.freq(p))));
-      const c = this.keyConf[p], alpha = Math.max(0.25, 1 / (c + 1));
-      this.keyOff[p] = Math.max(-60, Math.min(60, this.keyOff[p] + alpha * cents));
+      const c = this.keyConf[p];
+      // en mätning långt från vad tangenten redan lärt sig är misstänkt (en granntangent?): lita lite mindre
+      // på det inlärda, men flytta inget på en enda mätning
+      if (c >= 2 && Math.abs(cents) > 25) { this.keyConf[p] = c - 1; return false; }
+      const learned = [];
+      for (let q = 0; q < 128; q++) if (q === p || this.keyConf[q] >= 1) learned.push(q);
+      // när pianots stämning är känd (tre tangenter) får en enskild tangent avvika högst 45 cent från den
+      const lim = learned.length >= 3 ? 45 : 60, alpha = Math.max(0.25, 1 / (c + 1));
+      this.keyOff[p] = Math.max(-lim, Math.min(lim, this.keyOff[p] + alpha * cents));
       this.keyConf[p] = Math.min(12, c + 1);
       this._planKey(p);
-      if (this.autoTune) {
+      if (this.autoTune && learned.length >= 3) {
         // hela stämningen följer medianen av de inlärda tangenterna; de som inte lärts in följer med
-        const learned = [];
-        for (let q = 0; q < 128; q++) if (this.keyConf[q] >= 1) learned.push(q);
-        if (learned.length >= 3) {
-          const offs = learned.map(q => this.keyOff[q]).sort((a, b) => a - b);
-          const med = offs[offs.length >> 1];
-          if (Math.abs(med) >= 3) {
-            this.tune += med;
-            for (const q of learned) this.keyOff[q] -= med;
-            this._plan();
-          }
+        const offs = learned.map(q => this.keyOff[q]).sort((x, y) => x - y);
+        const med = offs[offs.length >> 1];
+        if (Math.abs(med) >= 3) {
+          this.tune += med;
+          for (const q of learned) this.keyOff[q] -= med;
+          this._plan();
         }
       }
       if (this.onLearn) this.onLearn();
@@ -334,8 +355,8 @@
         const off = len - j * hop - n;
         for (let i = 0; i < n; i++) { this.sre[i] = samples[off + i] * this.swin[i]; this.sim[i] = 0; }
         this.sfft(this.sre, this.sim);
-        const m = this.sSpec[j];
-        for (let k = 0; k < n / 2; k++) m[k] = Math.sqrt(this.sre[k] * this.sre[k] + this.sim[k] * this.sim[k]);
+        const m = this.sSpec[j], R = this.sRe[j], I = this.sIm[j];
+        for (let k = 0; k < n / 2; k++) { const xr = this.sre[k], xi = this.sim[k]; R[k] = xr; I[k] = xi; m[k] = Math.sqrt(xr * xr + xi * xi); }
       }
       const k0 = Math.round(1000 * n / this.sr), k1 = Math.min(n / 2 - 1, Math.round(8000 * n / this.sr));
       let best = 0, bj = -1;
@@ -370,26 +391,74 @@
       return m;
     }
 
-    // Plötslig förändring (dB) i tangentens deltoner mellan den korta rutan j (där smällen hördes) och rutan
-    // två steg före (43 ms tidigare, helt före anslaget). En svävning eller utklingning ändrar inget på 43 ms;
-    // ett anslag ändrar de flesta deltonerna med en gång (upp eller ner, beroende på fas).
+    // Plötslig förändring ("ryck", dB) i tangentens deltoner: skillnaden mellan en kort ruta och rutan 43 ms före,
+    // minus hur mycket deltonen redan ändrades under de 43 ms innan dess. Ett anslag ändrar de flesta deltonerna
+    // med en gång (upp eller ner, beroende på fas) efter att de legat stilla. En svävning – också en snabb, i en
+    // hög ton – ändrar dem lika mycket före som efter, och utklingning nästan inte alls.
     // Deltoner nära någon av appens egna toner (`own`) räknas inte – de korta rutorna är grova (23 Hz).
-    _jolt(p, own) {
+    _sUse(p, own) {
       const sb = this.sBands[p];
-      if (!sb) return 0;
-      const use = sb.filter(bd => !(own && [...own].some(q => { const qb = this.bands[q]; return qb && qb.some(o => { if (!OWN_PARTIALS.has(o.h)) return false; const c = (o.a + o.b) / 2 * this.sN / this.N; return c >= bd.a - 2 && c <= bd.b + 2; }); })));
+      if (!sb) return [];
+      return sb.filter(bd => !(own && [...own].some(q => { const qb = this.bands[q]; return qb && qb.some(o => { if (!OWN_PARTIALS.has(o.h)) return false; const c = (o.a + o.b) / 2 * this.sN / this.N; return c >= bd.a - 2 && c <= bd.b + 2; }); })));
+    }
+
+    // Ny svängning i tangentens deltoner, oberoende av fas: varje delton i en kort ruta förutsägs ur de två
+    // rutorna före (samma styrka, fasen vrids lika mycket till), och felet mot det som faktiskt hördes mäts i
+    // förhållande till deltonens styrka. En ton som bara klingar förutsägs nästan exakt. Ett nytt anslag lägger
+    // till en svängning som inte fanns: felet blir ungefär så stort som den nya svängningen, även när den
+    // råkar komma i motfas och styrkan inte ändras alls. Bakgrunden (svävning, toner som stör varandra) dras
+    // av genom att samma mått två rutor tidigare räknas bort. 0 = inget nytt, ca 1 = lika stark ny svängning.
+    _cjolt(p, own) { return this._cnov(p, own).rel; }
+    // rel = i förhållande till deltonernas styrka (hur stort är det nya mot det som klingade),
+    // abs = i absoluta tal (för att jämföra tangenter med varandra: var ligger det nya?)
+    _cnov(p, own) {
+      const use = this._sUse(p, own);
+      if (!use.length) return { rel: 0, abs: 0 };
+      // när appens eget ljud täcker deltoner måste minst två vara fria, varav grundtonen eller andra deltonen:
+      // en enda svag överton intill appens starka ljud ger falska utslag
+      if (own) { const sb = this.sBands[p]; if (use.length < 2 || !(use.includes(sb[0]) || use.includes(sb[1]))) return { rel: 0, abs: 0 }; }
+      const nu = j => {
+        const R0 = this.sRe[j], I0 = this.sIm[j], R1 = this.sRe[j + 1], I1 = this.sIm[j + 1], R2 = this.sRe[j + 2], I2 = this.sIm[j + 2];
+        let e = 0, r = 0;
+        for (let k = 0; k < use.length; k++) {
+          let ek = 0, rk = 0;
+          for (let i = use[k].a; i <= use[k].b; i++) {
+            const x1r = R1[i], x1i = I1[i], x2r = R2[i], x2i = I2[i];
+            let ur = x1r * x2r + x1i * x2i, ui = x1i * x2r - x1r * x2i;   // vridningen från ruta 2 till ruta 1
+            const um = Math.sqrt(ur * ur + ui * ui) + 1e-12; ur /= um; ui /= um;
+            const pr = x1r * ur - x1i * ui, pi = x1r * ui + x1i * ur;     // förutsägelsen för ruta 0
+            const dr = R0[i] - pr, di = I0[i] - pi, m1 = Math.sqrt(x1r * x1r + x1i * x1i);
+            ek += Math.sqrt(dr * dr + di * di); rk += m1;
+          }
+          e += W[k] * ek; r += W[k] * rk;
+        }
+        return [e, r];
+      };
+      let rel = 0, abs = 0;
+      for (let j = 0; j + 4 < S_FRAMES; j++) {
+        const a = nu(j), b = nu(j + 2);
+        const v = (a[1] > 0 ? a[0] / a[1] : 0) - (b[1] > 0 ? b[0] / b[1] : 0);
+        if (v > rel) rel = v;
+        if (a[0] - b[0] > abs) abs = a[0] - b[0];
+      }
+      return { rel, abs };
+    }
+
+    _jolt(p, own) {
+      const use = this._sUse(p, own);
       if (!use.length) return 0;
       let best = 0;
-      for (let j = 0; j + 2 < S_FRAMES; j++) {   // anslaget kan ligga i vilken som helst av de tre nyaste rutorna
-        const A = this.sSpec[j], B = this.sSpec[j + 2];
+      for (let j = 0; j + 4 < S_FRAMES; j++) {   // anslaget kan ligga i vilken som helst av de tre nyaste rutorna
+        const A = this.sSpec[j], B = this.sSpec[j + 2], C = this.sSpec[j + 4];
         let s = 0, w = 0;
         for (let k = 0; k < use.length; k++) {
-          let a = 0, b = 0;
-          for (let i = use[k].a; i <= use[k].b; i++) { if (A[i] > a) a = A[i]; if (B[i] > b) b = B[i]; }
+          let a = 0, b = 0, c = 0;
+          for (let i = use[k].a; i <= use[k].b; i++) { if (A[i] > a) a = A[i]; if (B[i] > b) b = B[i]; if (C[i] > c) c = C[i]; }
           const amp = Math.max(a, b);
           if (amp <= 0) continue;
+          const now = Math.abs(20 * Math.log10((a + 1e-7) / (b + 1e-7))), before = Math.abs(20 * Math.log10((b + 1e-7) / (c + 1e-7)));
           const wt = W[k] * amp;
-          s += wt * Math.min(20, Math.abs(20 * Math.log10((a + 1e-7) / (b + 1e-7))));
+          s += wt * Math.min(20, Math.max(0, now - before));
           w += wt;
         }
         if (w > 0 && s / w > best) best = s / w;
@@ -414,29 +483,34 @@
     }
 
     // Har tonen p blivit tydligt starkare än den var i baslinjen – totalt, i grundtonen och i de flesta
-    // deltonerna samtidigt? `wide` = använd de breda banden. `noFund` = grundtonens band räknas inte (där
-    // ligger en delton av appens eget ljud); då måste övertonerna själva bära beviset.
-    _risen(p, wide, noFund) {
+    // deltonerna samtidigt? `wide` = använd de breda banden. `mask` = deltoner där appens eget ljud ligger just
+    // nu: de räknas inte (annars ser en klingande ton ut att stiga när appen spelar ett ackord ovanför den).
+    // Är grundtonen själv maskerad måste övertonerna bära beviset.
+    _risen(p, wide, mask) {
       const a = this._peaks(this.cur, p, false, wide), b = this._peaks(this.base, p, false, wide);
-      const j0 = noFund ? 1 : 0;
-      let mx = 0, sa = 0, sb = 0;
-      for (let j = j0; j < a.length; j++) { if (a[j] > mx) mx = a[j]; sa += W[j] * a[j]; sb += W[j] * b[j]; }
+      const free = j => !(mask && mask.has(j));
+      const noFund = !free(0);
+      let mx = 0, sa = 0, sb = 0, n = 0;
+      for (let j = 0; j < a.length; j++) { if (!free(j)) continue; n++; if (a[j] > mx) mx = a[j]; sa += W[j] * a[j]; sb += W[j] * b[j]; }
+      if (mask && n < 2) return false;
       const need = Math.pow(10, this.riseDb / 20);
       if (sa < sb * need) return false;
       const needPart = Math.pow(10, (this.riseDb - 1) / 20);
-      const fund = p < 48 ? Math.max(a[0], a[1] || 0, a[2] || 0) : a[0];
-      const fundB = p < 48 ? Math.max(b[0], b[1] || 0, b[2] || 0) : b[0];
+      let fund = a[0], fundB = b[0];
+      if (p < 48) { fund = 0; fundB = 0; for (let j = 0; j < 3 && j < a.length; j++) if (free(j)) { if (a[j] > fund) fund = a[j]; if (b[j] > fundB) fundB = b[j]; } }
       if (noFund) {
         if (a.length < 3 || sa < 0.15 * a[0]) return false;   // övertonerna måste vara en rimlig del av det som hörs i grundtonsbandet
+        if (p >= 48) fundB = b[0];
       } else if (fund < fundB * needPart) return false;
       let wUp = 0, wAll = 0, nAud = 0;
-      for (let j = j0; j < a.length; j++) {
+      for (let j = 0; j < a.length; j++) {
+        if (!free(j)) continue;
         if (a[j] < 0.05 * mx) continue;      // deltoner som inte hörs räknas inte
         if (j > 0 && b[j] > fundB) continue; // bandet var redan starkare än grundtonen: en annan ton klingar där, säger inget
         wAll += W[j]; nAud++;
         if (a[j] >= b[j] * needPart) wUp += W[j];
       }
-      if (noFund && nAud < 2) return false;
+      if (mask && nAud < 2) return false;
       return wAll > 0 && wUp / wAll >= this.coherence;
     }
 
@@ -468,18 +542,32 @@
       // --- anslag (smäll) i korta rutor ---
       const th = this._thump(samples);
       this.lastThumpRatio = th.ratio;
+      // något anslagsliknande hördes (lägre tröskel än för omslag) – och det var inte bara appens egen ton som började
+      if (th.ratio >= 0.5 || (th.ratio >= 0.25 && !this.ownOnsets.some(o => nowMs - o.t > -40 && nowMs - o.t < 250))) this.lastSoftThump = nowMs;
       const msPer = 1000 / this.sr;
       // rycket i varje väntad tons deltoner mäts i varje analys och sparas en stund: smällen kan höras först
       // en analys eller två efter anslaget (en klingande ton döljer den), och då har de korta rutorna redan
       // passerat själva ögonblicket. Analyser nära appens egna anslag utelämnas (de rycker i egna band).
       if (expected) {
-        const nearOwn = this.ownOnsets.some(o => Math.abs(o.t - nowMs) < 120);
+        const nearOwn = this.ownOnsets.some(o => nowMs - o.t > -40 && nowMs - o.t < 250);
         for (const p of expected) {
           if (!this.bands[p]) continue;
           const h = (this.joltHist.get(p) || []).filter(e => nowMs - e.t < 400);
-          if (!nearOwn) h.push({ t: nowMs, v: this._jolt(p, null) });
+          if (!nearOwn) h.push({ t: nowMs, v: this._jolt(p, null), c: this._cnov(p, null).rel });
           this.joltHist.set(p, h);
         }
+      }
+      // smällar som hördes alldeles nyss: mät rycket igen. Smällen märks så fort anslaget börjar synas i den
+      // nyaste korta rutan, men ryckmåtten blir störst en analys eller två senare, när rutorna ligger rätt.
+      for (const pd of this.pendings) {
+        if (nowMs - pd.at > 180) continue;
+        const ownAt = new Set(this.ownOnsets.filter(o => o.t >= pd.at - 150 && o.t <= nowMs).map(o => o.p));
+        for (const p of pd.before.keys()) {
+          const cn = this._cnov(p, ownAt.size ? ownAt : null), jv = this._jolt(p, ownAt.size ? ownAt : null);
+          if (jv > pd.jolt.get(p)) pd.jolt.set(p, jv);
+          if (cn.rel > pd.cjolt.get(p)) pd.cjolt.set(p, cn.rel);
+        }
+        for (const [q, w] of pd.wrongBefore) { const c = this._cnov(q, ownAt.size ? ownAt : null).rel; if (c > w.c) w.c = c; }
       }
       if (th.ratio >= this.thumpRatio && nowMs >= this.ignoreThumpUntil) {
         const at = nowMs - (th.j * this.sHop + this.sN / 2) * msPer;   // ungefärlig tidpunkt för anslaget
@@ -493,8 +581,8 @@
         // före/efter-jämförelsen sätts upp bara första gången smällen hörs – senare analyser ser samma
         // anslag igen, och deras "före"-ruta skulle redan innehålla det
         if (fresh && expected && expected.size) {
-          const ownNear = new Set(this.ownOnsets.filter(o => at >= o.t - 40 && at <= o.t + 130).map(o => o.p));
-          const ownNow = new Set(this.ownOnsets.filter(o => Math.abs(o.t - at) <= 60).map(o => o.p));   // i själva anslagsögonblicket (de korta rutorna)
+          // appens egna toner som börjat i anslagsögonblicket (de korta rutorna spänner 150 ms bakåt)
+          const ownNow = new Set(this.ownOnsets.filter(o => o.t >= at - 150 && o.t <= at + 60).map(o => o.p));
           // nyaste långa rutan som slutar före anslaget, och en som slutar ett fönster tidigare (för driften)
           let bi = -1, di = -1;
           for (let k = 1; k < RING && fr - k >= 0; k++) {
@@ -503,16 +591,19 @@
             if (bi >= 0 && T <= at - this.winMs) { di = idx; break; }
           }
           if (bi >= 0) {
-            const before = new Map(), drift = new Map(), wrongBefore = new Map(), jolt = new Map(), ringing = new Map();
+            const before = new Map(), drift = new Map(), wrongBefore = new Map(), jolt = new Map(), cjolt = new Map(), ringing = new Map(), near = new Map();
+            let ownDt = 9999; for (const o of this.ownOnsets) if (o.t <= at + 60 && at - o.t < ownDt) ownDt = at - o.t;
             for (const p of expected) {
               if (!this.bands[p]) continue;
               const w = wideFor(p), b = this._peaks(this.ring[bi % RING], p, false, w);
               before.set(p, b);
               drift.set(p, di >= 0 ? this._stepDb(b, this._peaks(this.ring[di % RING], p, false, w)) : 0);
-              let jv = this._jolt(p, ownNow.size ? ownNow : null);
-              for (const e of this.joltHist.get(p) || []) if (e.t >= at - 100 && e.v > jv) jv = e.v;
-              jolt.set(p, jv);
+              let jv = this._jolt(p, ownNow.size ? ownNow : null), cv = this._cnov(p, ownNow.size ? ownNow : null).rel;
+              // (analyserna strax före: smällen kan ha märkts först en analys efter anslaget)
+              for (const e of this.joltHist.get(p) || []) if (e.t >= at - 100) { if (e.v > jv) jv = e.v; if (e.c > cv) cv = e.c; }
+              jolt.set(p, jv); cjolt.set(p, cv);
               ringing.set(p, this._salience(this.ring[bi % RING], p, w) >= this.quiet * 4);   // klingade tonen redan före anslaget?
+              near.set(p, NEAR.map(d => this._fundAmp(this.ring[bi % RING], p + d)));   // och grannarnas två första deltoner?
             }
             // fel tangenter som nyss hörts och kan klinga ännu: slås en sådan om igen hörs ingen ny ton,
             // så vi jämför hur mycket de ändras med hur mycket de väntade tonerna ändras
@@ -521,9 +612,9 @@
               if (!this.bands[p] || expected.has(p)) continue;
               if (this._salience(this.ring[bi % RING], p) < this.quiet * 4) continue;   // bara om den klingar före smällen
               const wb = this._peaks(this.ring[bi % RING], p);
-              wrongBefore.set(p, { b: wb, drift: di >= 0 ? this._stepDb(wb, this._peaks(this.ring[di % RING], p)) : 0 });
+              wrongBefore.set(p, { b: wb, drift: di >= 0 ? this._stepDb(wb, this._peaks(this.ring[di % RING], p)) : 0, c: this._cnov(p, ownNow.size ? ownNow : null).rel });
             }
-            this.pendings.push({ at, before, drift, wrongBefore, ownNear, ownNow, jolt, ringing, evals: 0, accepted: new Set(), blocked: false });
+            this.pendings.push({ at, before, drift, wrongBefore, ownNow, jolt, cjolt, ringing, near, ownDt, thump: th.ratio, evals: 0, accepted: new Set(), blocked: false });
             if (this.pendings.length > 4) this.pendings.shift();
           }
         }
@@ -585,7 +676,8 @@
         // spelaren ha slagit an den samtidigt: då måste övertonerna, där iPadens ljud inte ligger, själva ha stigit
         const overOwn = !!own && HARM.some(d => own.has(bp - d));
         if (overOwn && !exp) { if (trace) trace.push({ p: bp, bv, why: 'överton till egen' }); continue; }
-        if (!this._risen(bp, wide, overOwn)) { if (trace) trace.push({ p: bp, bv, why: 'ej stigit' + (overOwn ? ' (utan grundton)' : '') }); continue; }    // bara en svängning i en ton som redan klingar
+        const om = own && own.size ? this._ownMask(bp, own, wide) : null;   // deltoner där appens eget ljud ligger
+        if (!this._risen(bp, wide, om)) { if (trace) trace.push({ p: bp, bv, why: 'ej stigit' + (om ? ' (utan ' + [...om].map(j => j + 1) + ')' : '') }); continue; }    // bara en svängning i en ton som redan klingar
         // ligger toppen av det nya ljudet närmare en granntangent är det dess (breda) topp vi ser
         const s0 = this._salience(D0, bp, wide);
         if (this._nearestPitch(D0, bp, wide) !== bp) { if (trace) trace.push({ p: bp, bv, why: 'närmare granne' }); continue; }
@@ -603,10 +695,15 @@
         const parent = q => q >= 0 && (found.some(f => f.p === q && !f.ghost) || nowMs - this.lastOnset[q] < 400 ||
           this.recentExpected.some(e => e.set.has(q)) || (!!this.bands[q] && this._salience(D0, q) >= 0.3 * o.s0));
         o.ghost = HARM.some(d => parent(o.p - d));
+        // en baston har deltoner långt upp (11:e och uppåt ligger 41–56 halvtoner över grundtonen, nästan på
+        // varje tangent): en hög "ton" över en klingande eller nyss anslagen lägre ton är en sådan
+        if (!o.ghost) for (let d = 41; d <= 56 && !o.ghost; d++) { const q = o.p - d; if (q >= 0 && (found.some(f => f.p === q && !f.ghost) || nowMs - this.lastOnset[q] < 4000 || this.recentExpected.some(e => e.set.has(q)))) o.ghost = true; }
         // oväntad = en ny ton som varken väntats nyligen eller är en överton, och som hörs i tre analyser
         // i rad (en riktig ton stiger i 3–5 analyser; hammarsmällen ger falska kandidater i en eller två)
         const wasExpected = this.recentExpected.some(e => e.set.has(o.p));
-        if (!wasExpected && !o.ghost) {
+        // en riktig ton har också en egen andra delton; en ensam topp är någon annan tons överton
+        const fa = this._fundAmp(cur, o.p);
+        if (!wasExpected && !o.ghost && fa[1] >= 0.08 * fa[0]) {
           const seen = (this.pendingUnexpected.get(o.p) || []).filter(t => nowMs - t < Math.max(200, 3.6 * this.frameMs));
           seen.push(nowMs);
           this.pendingUnexpected.set(o.p, seen);
@@ -621,7 +718,7 @@
           if (chosen.has(p) || !this.bands[p]) continue;
           if (!(chosen.has(p - 12) || chosen.has(p - 19) || chosen.has(p - 24))) continue;
           const w = wideFor(p), v = this._salience(D, p, w);
-          if (v >= thr * 0.5 && v >= this._salience(D, p - 1) && v >= this._salience(D, p + 1) && this._risen(p, w, !!own && HARM.some(d => own.has(p - d)))) {
+          if (v >= thr * 0.5 && v >= this._salience(D, p - 1) && v >= this._salience(D, p + 1) && this._risen(p, w, own && own.size ? this._ownMask(p, own, w) : null)) {
             chosen.add(p);
             found.push({ p, strength: 20 * Math.log10(v / (medDiff + 1e-9)), expected: true });
           }
@@ -632,23 +729,34 @@
       for (let pi = this.pendings.length - 1; pi >= 0; pi--) {
         const pd = this.pendings[pi];
         if (!expected) { this.pendings.splice(pi, 1); continue; }
-        if (this.lastUnexpected >= pd.at - 100) pd.blocked = 'fel ton';   // någon annan ton slogs an – då var det den
         if ((this.thumpTimes || []).length > 6) pd.blocked = 'många smällar';   // många smällar i rad: tal, knackningar – inte pianospel
         if (nowMs - pd.at > this.winMs + 450 || pd.evals >= 3) this.pendings.splice(pi, 1);
         else if (nowMs - pd.at >= this.winMs + 20) {                 // den långa rutan ligger nu helt efter anslaget
           pd.evals++;
           const foundSet = new Set(found.map(o => o.p));
-          // appens egna toner som börjat mellan smällen och nu ligger i "efter"-rutan: deras band räknas inte
-          const ownSince = new Set(this.ownOnsets.filter(o => o.t >= pd.at - 40 && o.t <= nowMs).map(o => o.p));
-          // hur mycket mer än sin egen drift ändrades någon klingande fel tangent? (slogs den om igen?)
-          let wrongExcess = -Infinity;
-          for (const [p, w] of pd.wrongBefore) {
-            if (this._salience(cur, p) < this.quiet * 4) continue;
-            wrongExcess = Math.max(wrongExcess, this._stepDb(this._peaks(cur, p), w.b) - w.drift);
-          }
+          // appens egna toner som börjat från ett fönster före smällen till nu växer fortfarande mellan "före"- och
+          // "efter"-rutan: deras band räknas inte
+          const ownSince = new Set(this.ownOnsets.filter(o => o.t >= pd.at - 300 && o.t <= nowMs).map(o => o.p));
+          // En fel tangent kan bara förklara det som hänt i en väntad tons deltoner om den ligger intill den
+          // (±2 halvtoner) eller är harmoniskt släkt med den.
+          const explains = (q, p) => Math.abs(q - p) <= 2 || PitchDetector._related(p, q);
+          // hur mycket mer än sin egen drift ändrades en sådan klingande fel tangent? (slogs den om igen?)
+          const wrongEx = p => {
+            let x = -Infinity;
+            for (const [q, w] of pd.wrongBefore) {
+              if (!explains(q, p) || this._salience(cur, q) < this.quiet * 4) continue;
+              x = Math.max(x, this._stepDb(this._peaks(cur, q), w.b) - w.drift);
+            }
+            return x;
+          };
           const skip = (p, why) => { if (this.debug) this.lastRestrikeEval.push({ p, skipped: why }); };
           for (const [p, b] of pd.before) {
             if (foundSet.has(p) || pd.accepted.has(p) || !expected.has(p)) continue;
+            // slogs en fel tangent intill (eller en släkt ton) an vid den här smällen var det den
+            let wrongHit = -1;
+            for (const [q, t] of this.recentUnexpected) if (t >= pd.at - 100 && explains(q, p)) wrongHit = q;
+            if (wrongHit >= 0) { skip(p, 'fel ton slagen (' + wrongHit + ')'); continue; }
+            const wrongExcess = wrongEx(p);
             if (Math.abs(this.lastStrike[p] - pd.at) < 250) { skip(p, 'samma anslag'); continue; }   // redan rapporterad för just det här anslaget
             // appen godkände nyss en händelse med den här tonen utan att tonen hördes: anslaget strax före det
             // var den tonen, och får inte rapporteras i efterhand (det skulle räknas för nästa händelse)
@@ -667,28 +775,59 @@
             for (const [q, ts] of this.pendingUnexpected) if (q !== p && Math.abs(q - p) <= 2 && ts.filter(t => t >= pd.at - 50).length >= 2) neighbour = true;
             if (neighbour) { skip(p, 'granne hörd'); continue; }
             const w = wideFor(p), mask = ownSince.size ? this._ownMask(p, ownSince, w) : null;
-            if (mask && b.length - mask.size < 2) { skip(p, 'egen ton överallt'); continue; }   // för lite kvar att döma på
             if (this._salience(cur, p, w) < this.quiet * 4) { skip(p, 'hörs inte'); continue; }   // tonen måste höras
             if (this._nearestPitch(cur, p, w) !== p) { skip(p, 'närmare granne'); continue; }   // det som hörs är en granntangent
-            const after = this._peaks(cur, p, false, w), step = this._stepDb(after, b, mask), jolt = pd.jolt.get(p);
+            // en granntangent vars två första deltoner knappt hördes före smällen men hörs tydligt nu har slagits
+            // an i stället (grannar som själva väntas, eller där appens eget ljud ligger, säger inget)
+            let rose = -1;
+            const nb = pd.near.get(p), fp = this._fundAmp(cur, p), ownAll = new Set(this.ownOnsets.map(o => o.p));
+            for (let i = 0; i < 4; i++) {
+              const q = p + NEAR[i];
+              if (!this.bands[q] || expected.has(q)) continue;
+              const now = this._fundAmp(cur, q);
+              // en granne som blivit starkare vid smällen och nu klingar minst dubbelt så starkt som den här tonen
+              // dränker den: det som syns i den här tonens band är grannens anslag
+              if (now[0] >= 2 * fp[0] && now[0] >= 1.4 * nb[i][0] && fp[0] > 0) { rose = q; break; }
+              if (now[0] < 0.6 * fp[0] || now[0] < 4 * nb[i][0] || now[1] < 4 * nb[i][1] || now[1] < 0.1 * now[0]) continue;
+              const om = ownAll.size ? this._ownMask(q, ownAll, false) : null;
+              if (om && (om.has(0) || om.has(1))) continue;
+              rose = q;
+            }
+            if (rose >= 0) { skip(p, 'granne slagen (' + rose + ')'); continue; }
+            // Började appen en egen ton i samma ögonblick kan smällen vara appens: då krävs mer.
+            const ownNow = pd.ownNow.size > 0;
+            const judge = !(mask && b.length - mask.size < 2);   // går steget i den långa rutan att bedöma?
+            if (!judge && ownNow) { skip(p, 'egen ton överallt'); continue; }
+            const after = this._peaks(cur, p, false, w), step = judge ? this._stepDb(after, b, mask) : 0, jolt = pd.jolt.get(p), cj = pd.cjolt.get(p);
+            // en klingande fel tangent intill som fick en starkare ny svängning än den här: det var den som slogs om
+            let wrongRe = -1;
+            for (const [q, wq] of pd.wrongBefore) if (explains(q, p) && wq.c >= 0.25 && wq.c >= cj) wrongRe = q;
+            if (wrongRe >= 0) { skip(p, 'fel ton omslagen (' + wrongRe + ')'); continue; }
             // Driften (tonens egen förändring över en ruta) är opålitlig om tonen själv slogs an alldeles nyss –
             // då innehöll jämförelserutorna anslaget; en färsk ton svävar ändå lite i början.
             const fresh = pd.at - Math.max(this.lastStrike[p], this.lastMarked[p] - 300) < 750;
             // (en mycket stor drift är en svävningsnoll i en av rutorna, inte en trend – räknas bara till en gräns)
             const driftEst = fresh ? Math.min(pd.drift.get(p), 2) : Math.min(pd.drift.get(p), 6);
-            // Ett anslag av just den här tangenten ger ett ryck i dess deltoner på 43 ms; svävning, utklingning
-            // och andra tangenters anslag gör det inte. Började appen en egen ton samtidigt krävs ett tydligare ryck.
-            // Utan tydligt ryck måste steget dessutom överskrida tonens egen drift. Klingar en fel tangent måste
-            // den här tonen ha ändrats mer utöver sin drift än den fel tangenten utöver sin.
-            let need = this.stepDb;
-            if (jolt < 3) need = Math.max(need, driftEst + 0.5);
-            if (wrongExcess > -Infinity) need = Math.max(need, driftEst + Math.max(0, wrongExcess) + 0.5);
-            let needJolt = pd.ownNow.size ? 2.5 : 1.5;   // började appen en egen ton i samma ögonblick krävs ett tydligare ryck
-            // klingade tonen inte före anslaget är det en ny ton som det vanliga spåret borde ha hört; här är den
-            // reservutgången (t.ex. när grundtonen döljs av appens eget ljud), med höga krav: tyst -> ton är stort
-            if (!pd.ringing.get(p)) { need = Math.max(need, 6); needJolt = Math.max(needJolt, 3); }
-            this.lastRestrikeEval.push({ p, step, need, jolt, needJolt, drift: pd.drift.get(p), fresh, blocked: pd.blocked, mask: mask ? [...mask] : [], own: [...ownSince], before: Array.from(b), after: Array.from(after) });
-            if (!pd.blocked && step >= need && jolt >= needJolt) {
+            let ok, need = 0, needC = 0;
+            if (pd.ringing.get(p)) {
+              // Tonen klingade redan. Beviset för ett nytt anslag är en ny svängning i dess deltoner (fasmåttet):
+              // det syns även när den nya svängningen råkar komma i motfas och styrkan inte ändras alls.
+              // Började appen en egen ton i samma ögonblick kan smällen vara appens (dess mjuka ansats ger en svag
+              // smäll, ett pianoanslag en skarp): då krävs ett starkare utslag och dessutom en tydlig smäll –
+              // eller ett mycket starkt utslag.
+              // Klingar en fel tangent måste den här tonen dessutom ha ändrats mer utöver sin drift än den.
+              needC = ownNow ? 0.4 : judge ? 0.25 : 0.4;
+              if (judge && wrongExcess > -Infinity) need = driftEst + Math.max(0, wrongExcess) + 0.5;
+              ok = cj >= needC && step >= need && (!ownNow || pd.thump >= 0.5 || cj >= 0.9);
+            } else {
+              // Tonen klingade inte före anslaget: en ny ton som det vanliga spåret borde ha hört. Det här är
+              // reservutgången (t.ex. när grundtonen döljs av appens eget ljud), med höga krav: tyst -> ton är stort,
+              // och ett pianoanslag ger en skarp smäll.
+              need = 6;
+              ok = judge && step >= 6 && jolt >= 3 && (!ownNow || pd.thump >= 0.6);
+            }
+            this.lastRestrikeEval.push({ p, step, need, jolt, cjolt: cj, needC, ok, drift: pd.drift.get(p), fresh, blocked: pd.blocked, at: pd.at, ringing: pd.ringing.get(p), ownNow: pd.ownNow.size > 0, wrongExcess, thump: pd.thump, ownDt: pd.ownDt, judge, mask: mask ? [...mask] : [], own: [...ownSince], before: Array.from(b), after: Array.from(after) });
+            if (!pd.blocked && ok) {
               pd.accepted.add(p);
               // andra smällar mellan den här och nu hör till samma händelse (t.ex. appens egen ton strax före
               // spelarens anslag): de får inte rapportera tonen en gång till
@@ -714,6 +853,15 @@
         // en ton som rapporterats nyss kan bara rapporteras igen (som ny ton) om det hörts ett anslag sedan dess:
         // annars är det samma ton som fortsätter stiga medan rutan fylls
         if (!o.restrike && nowMs - this.lastOnset[o.p] < 700 && this.lastThump <= this.lastOnset[o.p]) continue;
+        // en tangent som klingat de senaste sekunderna kan svälla av sig själv (svävning). Som ny ton räknas den
+        // bara om något anslagsliknande hörts den senaste halvsekunden.
+        if (!o.restrike && nowMs - this.lastOnset[o.p] < 6000 && nowMs - this.lastSoftThump > 500) continue;
+        // appen godkände nyss en händelse där den här tonen ingick utan att den hörts (ackord där en ton saknades):
+        // den slogs an då, och att den hörs först nu är inget nytt tryck (det skulle räknas för nästa händelse)
+        if (!o.restrike && this.lastStrike[o.p] < this.lastMarked[o.p] - 600 && nowMs - this.lastMarked[o.p] < 400) {
+          this.lastOnset[o.p] = nowMs; this.lastStrike[o.p] = this.lastMarked[o.p] - 200;
+          continue;
+        }
         if (nowMs - this.lastOnset[o.p] > this.refractoryMs) {
           onsets.push(o); this.lastOnset[o.p] = nowMs;
           this.lastStrike[o.p] = o.restrike ? o.at : prev - 60;   // en ny ton syns första gången ca en analys efter anslaget

@@ -51,7 +51,7 @@ function addNote(buf, t0, p, vel, detune, keyDur, pedal, opts) {
   const B = INH * Math.min(2e-3, Math.max(5e-5, 1.2e-4 * 2 ** ((p - 48) / 12)));
   const amp = 0.07 * (vel / 127) ** 1.2;
   const tau0 = Math.max(0.5, 3.5 - (p - 36) / 60 * 2.8);
-  const len = Math.min(pedal ? 4.0 : 2.5, (pedal ? 4.0 : keyDur) + 0.6);
+  const len = Math.min(pedal ? 5.5 : 2.5, (pedal ? 5.5 : keyDur) + 0.6);   // (tonen tonas ut det sista: ett riktigt piano klipper inte tvärt)
   const i0 = Math.round(t0 * SR), n = Math.round(len * SR);
   const nStr = p < 40 ? 1 : p < 52 ? 2 : 3;
   for (let s = 0; s < nStr; s++) {
@@ -62,7 +62,7 @@ function addNote(buf, t0, p, vel, detune, keyDur, pedal, opts) {
       const tau = tau0 / (1 + 0.3 * (h - 1)), w = 2 * Math.PI * f / SR, ph = rnd() * 6.28;
       for (let k = 0; k < n && i0 + k < buf.length; k++) {
         const t = k / SR;
-        let env = Math.min(1, k / attack) * Math.exp(-t / tau);
+        let env = Math.min(1, k / attack) * Math.exp(-t / tau) * Math.min(1, (len - t) / 0.6);
         if (!pedal && t > keyDur) env *= Math.exp(-(t - keyDur) / 0.1);
         buf[i0 + k] += A * env * Math.sin(w * k + ph);
       }
@@ -77,8 +77,9 @@ const song = PianoMidi.buildSong(PianoMidi.parseMidi(mbuf.buffer.slice(mbuf.byte
 const HAND = process.env.HAND || 'R', TEMPO = 0.7, PEDAL = process.env.PEDAL !== '0';
 const pianoTune = p => GLOBAL + keyDev[p];   // spelarens piano; iPadens eget ljud är rent stämt
 const START = +(process.env.START || 0), NEV = +(process.env.NEV || 40);
-const hand = song.notes.filter(n => n.h === HAND);
-const other = song.notes.filter(n => n.h !== HAND);
+// HAND=B: båda händerna övas (inget ackompanjemang)
+const hand = HAND === 'B' ? song.notes : song.notes.filter(n => n.h === HAND);
+const other = HAND === 'B' ? [] : song.notes.filter(n => n.h !== HAND);
 const evs = [];
 for (const n of hand) { const e = evs[evs.length - 1]; if (e && Math.abs(e.t - n.s) < 0.03) e.ps.add(n.p); else evs.push({ t: n.s, ps: new Set([n.p]) }); }
 const sel = evs.slice(START, START + NEV);
@@ -94,7 +95,7 @@ const ACC_GAIN = +(process.env.ACC_GAIN || 1);
 const hop = 2400;   // 50 ms
 const det = new PianoDetector.PitchDetector(SR, process.env.N ? { fftSize: +process.env.N } : {});
 if (process.env.RISE) det.riseDb = +process.env.RISE;
-if (process.env.DEBUG === '4' || process.env.DEBUG === '5') det.debug = true;
+if (process.env.DEBUG === '4' || process.env.DEBUG === '5' || process.env.DEBUG === '6') det.debug = true;
 if (process.env.THUMP) det.thumpRatio = +process.env.THUMP;
 const thumpAt = [], thumpQuiet = [], accompAt = [], playerStrikes = [], thumpTimes = [], playerStrikeNotes = [];
 const evTrue = [], evFalse = [], accompNotes = [], wrongStrikes = [];
@@ -135,6 +136,10 @@ function satisfied(ev, got) {
   if (got.size >= ev.ps.size) return true;
   if (!LENIENT) return false;
   const missing = [...ev.ps].filter(p => !got.has(p));
+  if (process.env.LEN2 !== '0') {   // som appen: oktaver av hörda toner räknas inte som saknade (LEN2=0: den äldre regeln)
+    const eff = missing.filter(m => ![...got].some(q => Math.abs(q - m) % 12 === 0));
+    return got.size >= 1 && eff.length <= (ev.ps.size >= 5 ? 2 : ev.ps.size >= 3 ? 1 : 0);
+  }
   if (missing.length !== 1) return false;
   return ev.ps.size >= 3 || [...got].some(q => Math.abs(q - missing[0]) % 12 === 0);
 }
@@ -165,9 +170,10 @@ while (idx < sel.length && real < 380) {
     if (process.env.DEBUG === '3') for (const o of (det.lastFound || []).filter(o => o.unexpected)) {
       const acc = accompNotes.filter(n => Math.abs(n.t - real) < 0.6).map(n => n.p + '@' + (n.t - real).toFixed(2)); const pl = playerStrikeNotes.filter(n => real - n.t >= 0 && real - n.t < 1.5).map(n => n.p + '@' + (n.t - real).toFixed(2));
       console.log(`    ${real.toFixed(2)}s OVÄNTAD ${o.p} | ackomp [${acc}] | spelaren [${pl}] | väntade [${exp ? [...exp] : ''}]`); }
+    if (process.env.DEBUG === '6') for (const e of det.lastRestrikeEval.filter(e => !e.skipped)) console.log(`E ${playerStrikeNotes.some(n => n.p === e.p && real - n.t >= 0 && real - n.t < 0.9) ? 1 : 0} ${e.p} ${Math.round(e.at)} ${e.step.toFixed(2)} ${e.drift.toFixed(2)} ${e.fresh ? 1 : 0} ${e.jolt.toFixed(2)} ${e.ownNow ? 1 : 0} ${e.ringing ? 1 : 0} ${isFinite(e.wrongExcess) ? e.wrongExcess.toFixed(2) : 'x'} ${e.blocked ? 1 : 0} ${e.mask.length} ${wrongStrikes.some(st => real - st >= 0 && real - st < 0.9) ? 1 : 0} ${e.cjolt.toFixed(3)} ${e.thump.toFixed(2)} 0 0 ${e.cjolt.toFixed(3)} ${Math.round(e.ownDt)} ${e.judge ? 1 : 0}`);
     if (process.env.DEBUG === '5' && det.lastThump === real * 1000) console.log(`    ${real.toFixed(2)}s SMÄLL ${det.lastThumpRatio.toFixed(2)} väntade [${exp ? [...exp] : ''}] egna [${[...own]}] pågående ${det.pendings.length}`);
     if (process.env.DEBUG === '5') for (const e of det.lastRestrikeEval.filter(e => e.skipped)) console.log(`    ${real.toFixed(2)}s omslag ${e.p} hoppades över: ${e.skipped}`);
-    if (process.env.DEBUG === '5') for (const e of det.lastRestrikeEval.filter(e => !e.skipped)) console.log(`    ${real.toFixed(2)}s omslag ${e.p}: steg ${e.step.toFixed(1)} krav ${e.need.toFixed(1)} drift ${e.drift.toFixed(1)} ryck ${e.jolt.toFixed(1)} krav ${e.needJolt}${e.fresh ? ' färsk' : ''}${e.blocked ? ' BLOCK:' + e.blocked : ''} egna [${e.own}] mask [${e.mask}] före [${e.before.map(v => (20 * Math.log10(v + 1e-9)).toFixed(0))}] efter [${e.after.map(v => (20 * Math.log10(v + 1e-9)).toFixed(0))}]${playerStrikeNotes.some(n => n.p === e.p && real - n.t >= 0 && real - n.t < 0.9) ? ' ÄKTA' : ' falsk'}`);
+    if (process.env.DEBUG === '5') for (const e of det.lastRestrikeEval.filter(e => !e.skipped)) console.log(`    ${real.toFixed(2)}s omslag ${e.p}: steg ${e.step.toFixed(1)} krav ${e.need.toFixed(1)} drift ${e.drift.toFixed(1)} ryck ${e.jolt.toFixed(1)} fas ${e.cjolt.toFixed(2)} krav ${e.needC}${e.ok ? ' OK' : ' nej'}${e.ringing ? '' : ' (klingade ej)'}${e.fresh ? ' färsk' : ''}${e.blocked ? ' BLOCK:' + e.blocked : ''} egna [${e.own}] mask [${e.mask}] före [${e.before.map(v => (20 * Math.log10(v + 1e-9)).toFixed(0))}] efter [${e.after.map(v => (20 * Math.log10(v + 1e-9)).toFixed(0))}]${playerStrikeNotes.some(n => n.p === e.p && real - n.t >= 0 && real - n.t < 0.9) ? ' ÄKTA' : ' falsk'}`);
     if (process.env.DEBUG === '4') { const near = playerStrikes.concat(wrongStrikes).some(st => real - st >= -0.05 && real - st < 0.8);
       if (near && det.trace.length) console.log(`    ${real.toFixed(2)}s rå: ${det.trace.map(c => c.p + '(' + (20 * Math.log10(c.bv / det.traceThr)).toFixed(0) + 'dB ' + c.why + ')').join(', ')} | väntade [${exp ? [...exp] : ''}] | egna [${[...own]}] | smäll ${det.lastThumpRatio.toFixed(2)}${det.lastRestrikeEval.length ? ' | omslag ' + det.lastRestrikeEval.map(e => e.p + ':' + e.step.toFixed(1) + '/' + e.need.toFixed(1) + (e.blocked ? 'B' : '')).join(' ') : ''}`); }
     if (process.env.DEBUG === '2') { const all = det.lastFound || []; const near = playerStrikes.concat(wrongStrikes).some(st => real - st >= -0.05 && real - st < 0.6);
@@ -177,6 +183,7 @@ while (idx < sel.length && real < 380) {
     for (const e of (det.lastRestrikeEval || []).filter(e => !e.skipped)) { const isTrue = playerStrikeNotes.some(n => n.p === e.p && real - n.t >= 0 && real - n.t < 0.9); (isTrue ? evTrue : evFalse).push(e); }
     { let since = Infinity; for (const st of strikes) { const d = real - st; if (d >= 0 && d < since) since = d; }
       if (since <= 0.1) thumpAt.push(det.lastThumpRatio); else if (since > 0.4 && det.level > -55) thumpQuiet.push(det.lastThumpRatio); }
+    if (process.env.DEBUG === '7') for (const o of ons) console.log(`    ${real.toFixed(2)}s RAPPORT ${o.p}${o.restrike ? ' (omslag)' : ''}${o.expected ? '' : ' oväntad'} | väntar ${waiting} på [${[...ev.ps]}] | smäll ${det.lastThumpRatio.toFixed(2)} | egna [${[...own]}]`);
     for (const o of ons) {
       pressId[o.p] = ++seq; pressT[o.p] = real;
       if (waiting && ev.ps.has(o.p)) { got.add(o.p); consumed[o.p] = pressId[o.p]; lastLat = o.restrike ? LAT_RESTRIKE : LAT; }
@@ -234,7 +241,7 @@ console.log(`${HAND}-hand ev ${START}-${START + sel.length} (piano ${GLOBAL}c ±
   console.log(`  inlärt: stämning ${det.tune.toFixed(1)}c (pianot ${GLOBAL}c), ${learned.length} tangenter, fel per tangent medel ${mean}c max ${mx}c`); }
 log.slice(0, 12).forEach(l => console.log('  ' + l));
 const pctN = (arr, q) => { const a = arr.slice().sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(q * a.length))].toFixed(1) : '-'; };
-const okEval = e => !e.blocked && e.step >= e.need && e.jolt >= e.needJolt;
+const okEval = e => !e.blocked && e.ok;
 const blockWhy = arr => { const m = {}; for (const e of arr) if (e.blocked) m[e.blocked] = (m[e.blocked] || 0) + 1; return Object.entries(m).map(([k, v]) => k + ' ' + v).join(', ') || '0'; };
 console.log(`  omslag äkta (${evTrue.length} bedömningar, ${evTrue.filter(okEval).length} godkända): steg p10 ${pctN(evTrue.map(e=>e.step),0.1)} p25 ${pctN(evTrue.map(e=>e.step),0.25)} p50 ${pctN(evTrue.map(e=>e.step),0.5)} | krav p50 ${pctN(evTrue.map(e=>e.need),0.5)} | drift p50 ${pctN(evTrue.map(e=>e.drift),0.5)} | ryck p10 ${pctN(evTrue.map(e=>e.jolt),0.1)} p25 ${pctN(evTrue.map(e=>e.jolt),0.25)} p50 ${pctN(evTrue.map(e=>e.jolt),0.5)} | blockerade: ${blockWhy(evTrue)}`);
 console.log(`  omslag falska (${evFalse.length} bedömningar): steg p50 ${pctN(evFalse.map(e=>e.step),0.5)} p90 ${pctN(evFalse.map(e=>e.step),0.9)} p99 ${pctN(evFalse.map(e=>e.step),0.99)} max ${pctN(evFalse.map(e=>e.step),1)} | krav p50 ${pctN(evFalse.map(e=>e.need),0.5)} | ryck p50 ${pctN(evFalse.map(e=>e.jolt),0.5)} p90 ${pctN(evFalse.map(e=>e.jolt),0.9)} p99 ${pctN(evFalse.map(e=>e.jolt),0.99)} max ${pctN(evFalse.map(e=>e.jolt),1)} | godkända ${evFalse.filter(okEval).length}`);

@@ -140,15 +140,15 @@
     function ctx() {
       if (!ac) {
         ac = new (window.AudioContext || window.webkitAudioContext)();
-        const comp = ac.createDynamicsCompressor();
-        comp.threshold.value = -16; comp.ratio.value = 4;
-        master = ac.createGain(); master.gain.value = 0.34;
-        master.connect(comp); comp.connect(ac.destination);
+        // ingen kompressor: den sänker de toner som redan klingar varje gång en ny börjar, och det rycket i
+        // iPadens eget ljud ser för mikrofonen ut som ett anslag
+        master = ac.createGain(); master.gain.value = 0.5;
+        master.connect(ac.destination);
       }
       if (ac.state !== 'running') ac.resume().catch(() => {});
       return ac;
     }
-    function noteOn(p, vel) {
+    function noteOn(p, vel, soft) {
       ctx();
       const now = ac.currentTime, f = 440 * Math.pow(2, (p - 69) / 12), k = vel / 127;
       const amp = 0.06 + 0.45 * Math.pow(k, 1.4);
@@ -161,11 +161,13 @@
       const g2 = ac.createGain(); g2.gain.value = 0.28;
       o1.connect(lp); o2.connect(g2); g2.connect(lp); lp.connect(g); g.connect(master);
       const decay = Math.max(0.5, 2.6 - (p - 36) / 60 * 1.9);
-      // mjuk ansats (60 ms): då låter iPadens eget ljud sällan som ett tangentanslag för mikrofonen
+      // mjuk ansats: då låter iPadens eget ljud inte som ett tangentanslag för mikrofonen. Extra mjuk (120 ms)
+      // när mikrofonen lyssnar och du själv spelar, annars 60 ms.
+      const att = soft ? 0.12 : 0.06;
       g.gain.setValueAtTime(0, now);
-      g.gain.linearRampToValueAtTime(amp, now + 0.06);
-      g.gain.setTargetAtTime(amp * 0.4, now + 0.06, 0.22);
-      g.gain.setTargetAtTime(0.0001, now + 0.35, decay);
+      g.gain.linearRampToValueAtTime(amp, now + att);
+      g.gain.setTargetAtTime(amp * 0.4, now + att, 0.22);
+      g.gain.setTargetAtTime(0.0001, now + att + 0.29, decay);
       o1.start(now); o2.start(now); o1.stop(now + 14); o2.stop(now + 14);
       const v = { g, oscs: [o1, o2], released: false };
       live.add(v);
@@ -243,12 +245,13 @@
   function expectedSet() {
     if (S.mode === 'wait') {
       const ev = practice[pendIdx];
-      if (ev && (waiting || (ev.t - t) / S.tempo < 0.6)) return ev.pitches;
+      if (ev && (waiting || (ev.t - t) / S.tempo < PRE_WINDOW)) return ev.pitches;
       return null;
     }
     if (S.mode === 'play') {
-      const set = new Set(), win = 0.5 * S.tempo;
-      for (let i = lowerBound(notes, t - win, n => n.s); i < notes.length && notes[i].s <= t + win; i++) {
+      // bakåt en hel sekund: ett omslag bedöms först ca 0,45 s efter anslaget, och då måste tonen fortfarande väntas
+      const set = new Set(), back = 1.0 * S.tempo, ahead = 0.5 * S.tempo;
+      for (let i = lowerBound(notes, t - back, n => n.s); i < notes.length && notes[i].s <= t + ahead; i++) {
         if (practiced(notes[i].h)) set.add(notes[i].p);
       }
       return set.size ? set : null;
@@ -267,8 +270,10 @@
     if (S.mode === 'listen') return;
     for (const o of onsets) {
       if (now - appPlayed[o.p] < 400) continue;          // iPadens eget ljud
-      userNoteOn(o.p, 'mic', o.restrike ? 0.45 : MIC_LATENCY);   // ett omslag hörs ca 0,45 s efter anslaget
-      setTimeout(() => userNoteOff(o.p, 'mic'), 260);
+      // en oväntad ton som är en överton till något iPaden själv nyss spelat visas inte som "hörd tangent"
+      const echo = !o.expected && [0, 12, 19, 24, 28].some(d => o.p - d >= 0 && now - appPlayed[o.p - d] < 1500);
+      userNoteOn(o.p, 'mic', o.restrike ? 0.45 : MIC_LATENCY, echo);   // ett omslag hörs ca 0,45 s efter anslaget
+      setTimeout(() => userNoteOff(o.p, 'mic'), 350);
     }
   }
   // Detektorn har lärt sig mer om pianots stämning: spara det till nästa gång.
@@ -322,7 +327,7 @@
   function noteStart(n) {
     const audible = S.sound === 'on' && (S.mode === 'listen' || (!practiced(n.h) && S.accomp));
     if (audible) {
-      n._voice = synth.noteOn(n.p, n.v);
+      n._voice = synth.noteOn(n.p, n.v, mic.on && S.mode !== 'listen');
       appPlayed[n.p] = performance.now();
       if (mic.det) mic.det.markOwnOnset(performance.now(), n.p);   // iPadens eget anslag får inte bevisa ett omslag av en släkt ton
     }
@@ -349,6 +354,7 @@
       if (!practiced(n.h)) continue;
       if (cur && n.s - cur.t <= CHORD_TOL) cur.notes.push(n);
       else { cur = { t: n.s, notes: [n], got: new Set() }; practice.push(cur); }
+      n._ev = cur;
     }
     practice.forEach(ev => { ev.pitches = new Set(ev.notes.map(n => n.p)); });
   }
@@ -389,16 +395,17 @@
   }
   function satisfied(ev) {
     if (ev.got.size >= ev.pitches.size) return true;
-    if (!mic.on) return false;
-    // med mikrofon: godkänn om bara en ton saknas i ett ackord med minst tre toner,
-    // eller om det som saknas är en oktav av en ton som hörts (oktaver är svåra att höra isär)
-    const missing = [...ev.pitches].filter(p => !ev.got.has(p));
-    if (missing.length !== 1) return false;
-    return ev.pitches.size >= 3 || [...ev.got].some(q => Math.abs(q - missing[0]) % 12 === 0);
+    if (!mic.on || !ev.got.size) return false;
+    // med mikrofon: oktaver av toner som hörts räknas inte som saknade (de går inte att höra isär säkert).
+    // Av de övriga får en ton saknas i ackord med minst tre toner, två i ackord med minst fem.
+    const missing = [...ev.pitches].filter(p => !ev.got.has(p) && ![...ev.got].some(q => Math.abs(q - p) % 12 === 0));
+    return missing.length <= (ev.pitches.size >= 5 ? 2 : ev.pitches.size >= 3 ? 1 : 0);
   }
   // `lat` = ungefär så många sekunder innan den hördes slogs tonen an (tonigenkänningens fördröjning)
+  let lastDone = null;   // senast klarade händelse och när
   function completeEvent(ev, skipped, lat) {
     const now = performance.now();
+    lastDone = { ev, t: now };
     ev.notes.forEach(n => { n.hit = !skipped; });
     if (!skipped) score.ok += ev.pitches.size;
     if (!skipped && mic.det) for (const p of ev.pitches) mic.det.markPlayed(p, now);   // även toner som inte hördes klingar nu
@@ -422,7 +429,8 @@
     else waiting = true;
   }
   function checkMisses() {
-    const win = (mic.on ? 0.45 + MIC_LATENCY : 0.35) * S.tempo;
+    // med mikrofon: träffönstret (0,45 s) plus den längsta fördröjningen i igenkänningen (ett omslag, ca 0,45 s)
+    const win = (mic.on ? 0.45 + 0.5 : 0.35) * S.tempo;
     while (missIdx < practice.length && practice[missIdx].t + win < t) {
       practice[missIdx].notes.forEach(n => { if (!n.hit) { n.miss = true; score.miss++; } });
       missIdx++;
@@ -452,14 +460,19 @@
 
   // ---------- Det du spelar ----------
   const userVoices = new Map();
-  function userNoteOn(p, src, lat) {
+  function userNoteOn(p, src, lat, hide) {
     const now = performance.now();
-    pressed.set(p, { wrong: false, src });
+    pressed.set(p, { wrong: false, src, hide });
     pressTime[p] = now;
     pressId[p] = ++pressSeq;
     if (src === 'mouse' && S.sound === 'on') userVoices.set(p, synth.noteOn(p, 90));
     const countWrong = src !== 'mic';     // mikrofonen kan höra övertoner, så den räknar inte fel
     if (S.mode === 'wait') {
+      // en ton ur ackordet som nyss godkändes (fast just den inte hunnit höras) hör dit – inte till nästa händelse
+      if (src === 'mic' && lastDone && now - lastDone.t < 350 && lastDone.ev.pitches.has(p) && !lastDone.ev.got.has(p)) {
+        lastDone.ev.got.add(p); consumed[p] = pressId[p];
+        return;
+      }
       const ev = practice[pendIdx];
       if (waiting && ev) {
         if (ev.pitches.has(p)) {
@@ -470,14 +483,21 @@
         }
       }
     } else if (S.mode === 'play') {
-      const tt = src === 'mic' ? t - MIC_LATENCY * S.tempo : t;
+      // tonen slogs an en stund innan den hördes (ett omslag ca 0,45 s, annars ca 0,15 s)
+      const tt = src === 'mic' ? t - (lat || MIC_LATENCY) * S.tempo : t;
       const win = (src === 'mic' ? 0.45 : 0.35) * S.tempo;
       let best = null;
       for (let i = lowerBound(notes, tt - win, n => n.s); i < notes.length && notes[i].s <= tt + win; i++) {
         const n = notes[i];
         if (n.p === p && !n.hit && practiced(n.h) && (!best || Math.abs(n.s - tt) < Math.abs(best.s - tt))) best = n;
       }
-      if (best) { best.hit = true; best.miss = false; score.ok++; }
+      const hit = n => { if (n.miss && score.miss > 0) score.miss--; n.hit = true; n.miss = false; score.ok++; };   // (kan ha hunnit räknas som missad)
+      if (best) {
+        hit(best);
+        // med mikrofon gäller samma ackordregel som i vänta-läget: hörs tillräckligt av ackordet räknas hela
+        const ev = best._ev;
+        if (src === 'mic' && ev) { ev.got.add(p); if (satisfied(ev)) ev.notes.forEach(n => { if (!n.hit) hit(n); }); }
+      }
       else if (countWrong) { score.bad++; pressed.get(p).wrong = true; }
     }
   }
@@ -542,6 +562,7 @@
       if (y < 0) break;
       if (y > kbTop) continue;
       ctx.fillStyle = '#262a33'; ctx.fillRect(0, Math.round(y), W, 1);
+      if (y < 46) continue;   // högst upp står redan del och takt – taktsiffran skulle hamna ovanpå
       ctx.fillStyle = '#6b7383'; ctx.font = '12px -apple-system, system-ui, sans-serif'; ctx.fillText(String(b + 1), 6, y - 2);
       const mk = markerAtBar.get(b + 1);
       if (mk) { ctx.fillStyle = '#c9d2e0'; ctx.font = '600 13px -apple-system, system-ui, sans-serif'; ctx.fillText(mk, 30, y - 2); }
@@ -623,6 +644,14 @@
       if (look) { ctx.globalAlpha = look.a; ctx.fillStyle = look.fill; ctx.fill(); ctx.globalAlpha = 1; }
       if (accompLit.has(p)) { ctx.fillStyle = COLORS[accompLit.get(p).h].main; ctx.globalAlpha = 0.6; ctx.fillRect(k.x + 1, kbTop, k.w - 2, 4); ctx.globalAlpha = 1; }
     }
+    // en grå prick = mikrofonen hörde den här tangenten, fast den inte väntades (så syns det vad appen uppfattar)
+    for (const [p, pr] of pressed) {
+      if (pr.src !== 'mic' || pr.hide || pr.wrong || lit.has(p) || (pend && pend.got.has(p))) continue;
+      const k = keys[p]; if (!k) continue;
+      ctx.beginPath();
+      ctx.arc(k.x + k.w / 2, k.black ? kbTop + blackH - 10 : kbTop + kbH - 34, Math.max(3, Math.min(5.5, k.w * 0.2)), 0, Math.PI * 2);
+      ctx.fillStyle = '#7d8696'; ctx.fill();
+    }
     for (const [p, n] of lit) {
       const k = keys[p]; if (!k) continue;
       const r = Math.max(7, Math.min(12, k.w * (k.black ? 0.5 : 0.36)));
@@ -656,7 +685,7 @@
       $('score').textContent = sc;
       $('waitBox').hidden = !waiting;
       $('waitText').textContent = wt;
-      $('waitBox').style.top = Math.max(40, kbTop - 54) + 'px';
+      $('waitBox').style.top = '40px';   // uppe i kanten: nere vid tangenterna skymde rutan tonerna som är på väg
       $('timeVal').textContent = `${fmt(t)} / ${fmt(DUR)}`;
     }
     if (!seeking) $('seek').value = String(Math.max(0, t));
@@ -910,7 +939,7 @@
 
   // för felsökning och test
   window.__po = { S, get t() { return t; }, get waiting() { return waiting; }, get playing() { return playing; },
-    get practice() { return practice; }, get notes() { return notes; }, get sections() { return sections; },
+    get practice() { return practice; }, get pendIdx() { return pendIdx; }, get notes() { return notes; }, get sections() { return sections; },
     get mic() { return mic; }, score, userNoteOn, userNoteOff, setPlaying, seek, update, startMic,
     micTick: now => micTick(now), loadDemo: () => loadSong(demoSong()) };
 })();
