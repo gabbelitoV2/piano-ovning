@@ -10,6 +10,7 @@ En övningsapp för piano som körs i webbläsaren, gjord för iPad på notstäl
 - **USB-klaviatur** (Chrome/Edge på dator, Web MIDI): tangenttrycken läses direkt från ett digitalpiano, utan mikrofon.
   Har klaviaturen tangenter som lyser (Casio LK-serien) tänds den tangent som ska spelas på själva klaviaturen.
 - **Säg finger**: en röst säger vilket finger (och vilken hand, när båda övas) när musiken väntar på dig.
+- **Pianots röst**: med en Casio LK säger pianot självt fingret, med rösten från sina inbyggda lektioner.
 
 Öppna sidan i Safari på iPaden, tryck **Öppna låt** och sedan **Starta mikrofonen**.
 
@@ -18,7 +19,14 @@ En övningsapp för piano som körs i webbläsaren, gjord för iPad på notstäl
 En Casio LK tänder tangenten för varje ton den får på sin lektionskanal (kanal 4). Appen skickar tonerna dit med
 anslagsstyrka 1 och kanalens uttryck (CC 11) på 0: tangenten lyser men pianot låter inte. När sidan lämnas släcks allt
 och uttrycket sätts tillbaka till 127. Portar som inte är klaviaturer (Windows inbyggda synt, loopMIDI och liknande)
-hoppas över. Rösten är tyst när mikrofonen lyssnar, eftersom den annars skulle kunna tas för en ton.
+hoppas över. Datorns röst är tyst när mikrofonen lyssnar, eftersom den annars skulle kunna tas för en ton.
+
+### Pianots egen röst
+
+Rösten som räknar fingrarna i Casios inbyggda lektioner ("one" … "five") ligger som fem ljud i pianots trumset:
+tangent 92–96 på MIDI-kanal 10, program 0. Appen skickar dem dit, så att pianot självt säger fingret. Det står inte i
+Casios dokument; det är hittat på en LK-280 genom att lyssna igenom pianots ljud. Pianots display kan däremot inte
+fås att visa fingrarna för egna låtar – fingrarna visas på skärmen i appen.
 
 ## Filer
 

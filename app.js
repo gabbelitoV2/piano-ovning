@@ -19,7 +19,7 @@
 
   // ---------- Inställningar ----------
   const S = { hand: 'R', mode: 'wait', tempo: 0.7, section: 0, loop: true, fingers: true, names: false,
-    sound: 'on', accomp: true, sens: 0.5, tune: 0, keyOff: {}, speak: true };
+    sound: 'on', accomp: true, sens: 0.5, tune: 0, keyOff: {}, speak: true, pianoVoice: true };
   try { Object.assign(S, JSON.parse(localStorage.getItem('po-settings') || '{}')); } catch (e) { /* ingen lagring */ }
   function saveSettings() { try { localStorage.setItem('po-settings', JSON.stringify(S)); } catch (e) { /* ok */ } }
 
@@ -295,7 +295,7 @@
   // sin lektionskanal (kanal 4). Tonerna skickas med styrka 1 och kanalens uttryck på 0, så tangenten lyser utan
   // att pianot låter – ljudet kommer först när du själv trycker ner den.
   // lit: tangent -> antal toner som håller den tänd, notes: de toner som tänt något, offAt: när tangenten senast släcktes
-  const midi = { access: null, out: null, name: '', lit: new Map(), notes: new Set(), offAt: new Float64Array(128) };
+  const midi = { access: null, out: null, casio: false, name: '', lit: new Map(), notes: new Set(), offAt: new Float64Array(128) };
   const LIGHT_CH = 3;                                            // kanal 4 (räknat från noll)
   const VIRTUAL = /wavetable|microsoft gs|loop|virtual|thru|through|mcp|iac/i;   // portar som inte är klaviaturer
   function midiSend(bytes) { if (midi.out) { try { midi.out.send(bytes); } catch (e) { /* frånkopplad */ } } }
@@ -350,6 +350,7 @@
     if ((out && out.id) !== (midi.out && midi.out.id)) {
       lightsOut();
       midi.out = out;
+      midi.casio = !!out && /casio/i.test(out.name || '');
       lightsOut();                                               // börja släckt och tyst på den nya porten
     }
     $('midiBtn').textContent = ins.length ? 'Klaviatur ansluten' : 'USB-klaviatur';
@@ -377,11 +378,31 @@
   // ---------- Röst som säger vilket finger ----------
   const FINGER_SV = ['', 'ett', 'två', 'tre', 'fyra', 'fem'];
   let sayTimer = 0;
+  // Pianots egen röst: en Casio LK har rösten som räknar fingrarna ("one" … "five") som fem ljud i sitt trumset,
+  // tangent 92–96 på kanal 10 (program 0). Skickas de dit säger pianot självt fingret, med samma röst som i
+  // pianots inbyggda lektioner. (Hittat genom att lyssna igenom pianots ljud; står inte i Casios dokument.)
+  const VOICE_CH = 9, VOICE_KEY = 91, VOICE_GAP = 480;
+  let pianoSayTimers = [];
+  function pianoHush() { pianoSayTimers.forEach(clearTimeout); pianoSayTimers = []; }
+  function pianoSay(fingers) {
+    pianoHush();
+    midiSend([0xB0 | VOICE_CH, 0, 120]); midiSend([0xC0 | VOICE_CH, 0]);       // trumset 1 – där ligger rösten
+    midiSend([0xB0 | VOICE_CH, 7, 127]); midiSend([0xB0 | VOICE_CH, 11, 127]);
+    fingers.forEach((f, i) => {
+      pianoSayTimers.push(setTimeout(() => {
+        midiSend([0x90 | VOICE_CH, VOICE_KEY + f, 127]);
+        setTimeout(() => midiSend([0x80 | VOICE_CH, VOICE_KEY + f, 0]), 350);
+      }, i * VOICE_GAP));
+    });
+  }
   function sayFingers(ev) {
-    // med mikrofonen på är rösten tyst: den skulle höras i mikrofonen och kunna tas för en ton
-    if (!S.speak || mic.on || !window.speechSynthesis) return;
+    if (!S.speak) return;
     const ns = ev.notes.filter(n => n.f).sort((a, b) => a.p - b.p).slice(0, 6);
     if (!ns.length) return;
+    // en Casio säger fingret själv (vid flera toner: från vänster till höger på klaviaturen)
+    if (midi.out && midi.casio && S.pianoVoice) { pianoSay(ns.map(n => n.f)); return; }
+    // med mikrofonen på är datorns röst tyst: den skulle höras i mikrofonen och kunna tas för en ton
+    if (mic.on || !window.speechSynthesis) return;
     let voice = null;
     try { voice = speechSynthesis.getVoices().find(v => /^sv/i.test(v.lang)) || null; } catch (e) { /* inga röster */ }
     // finns ingen svensk röst sägs siffrorna på röstens eget språk
@@ -436,6 +457,7 @@
     synth.allOff();
     lightsOut();
     clearTimeout(sayTimer);
+    pianoHush();
     if (window.speechSynthesis) speechSynthesis.cancel();
   }
   function buildPractice() {
@@ -498,6 +520,7 @@
   function completeEvent(ev, skipped, lat) {
     const now = performance.now();
     lastDone = { ev, t: now };
+    pianoHush();                       // tonen är spelad: resten av fingrarna behöver inte sägas
     ev.notes.forEach(n => { n.hit = !skipped; });
     if (!skipped) score.ok += ev.pitches.size;
     if (!skipped && mic.det) for (const p of ev.pitches) mic.det.markPlayed(p, now);   // även toner som inte hördes klingar nu
@@ -905,6 +928,7 @@
   bindChk('fingerChk', 'fingers', false);
   bindChk('nameChk', 'names', false);
   bindChk('speakChk', 'speak', false);
+  bindChk('pianoVoiceChk', 'pianoVoice', false);
   bindChk('accompChk', 'accomp', true);
 
   const soundSel = $('soundSel');
