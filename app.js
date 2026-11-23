@@ -19,7 +19,7 @@
 
   // ---------- Inställningar ----------
   const S = { hand: 'R', mode: 'wait', tempo: 0.7, section: 0, loop: true, fingers: true, names: false,
-    sound: 'on', accomp: true, sens: 0.5, tune: 0, keyOff: {} };
+    sound: 'on', accomp: true, sens: 0.5, tune: 0, keyOff: {}, speak: true };
   try { Object.assign(S, JSON.parse(localStorage.getItem('po-settings') || '{}')); } catch (e) { /* ingen lagring */ }
   function saveSettings() { try { localStorage.setItem('po-settings', JSON.stringify(S)); } catch (e) { /* ok */ } }
 
@@ -290,26 +290,112 @@
   }
 
   // ---------- USB-klaviatur (Web MIDI, där det finns) ----------
-  if (navigator.requestMIDIAccess) $('midiBtn').hidden = false;
-  $('midiBtn').addEventListener('click', async () => {
-    try {
-      const access = await navigator.requestMIDIAccess();
-      const bind = () => {
-        let n = 0;
-        access.inputs.forEach(inp => {
-          n++;
-          inp.onmidimessage = e => {
-            const [st, a, b] = e.data, type = st & 0xF0;
-            if (type === 0x90 && b > 0) userNoteOn(a, 'midi');
-            else if (type === 0x80 || (type === 0x90 && b === 0)) userNoteOff(a, 'midi');
-          };
-        });
-        toast(n ? 'USB-klaviaturen är ansluten.' : 'Ingen USB-klaviatur hittades.');
+  // Tangenttrycken läses direkt från klaviaturen: exakt, och ingen mikrofon behövs. Har klaviaturen tangenter som
+  // lyser (Casio LK m.fl.) tänds de tangenter som ska spelas: en Casio tänder tangenten för varje ton den får på
+  // sin lektionskanal (kanal 4). Tonerna skickas med styrka 1 och kanalens uttryck på 0, så tangenten lyser utan
+  // att pianot låter – ljudet kommer först när du själv trycker ner den.
+  // lit: tangent -> antal toner som håller den tänd, notes: de toner som tänt något, offAt: när tangenten senast släcktes
+  const midi = { access: null, out: null, name: '', lit: new Map(), notes: new Set(), offAt: new Float64Array(128) };
+  const LIGHT_CH = 3;                                            // kanal 4 (räknat från noll)
+  const VIRTUAL = /wavetable|microsoft gs|loop|virtual|thru|through|mcp|iac/i;   // portar som inte är klaviaturer
+  function midiSend(bytes) { if (midi.out) { try { midi.out.send(bytes); } catch (e) { /* frånkopplad */ } } }
+  const BLINK = 70;                                              // ms som en tangent är släckt innan den tänds på nytt
+  function lightOn(p) {
+    const c = midi.lit.get(p) || 0, now = performance.now();
+    midi.lit.set(p, c + 1);
+    // lyser tangenten redan (samma ton igen) släcks den en kort stund, så att det syns att den ska slås an på nytt
+    if (c) { midiSend([0x80 | LIGHT_CH, p, 0]); midi.offAt[p] = now; }
+    const wait = BLINK - (now - midi.offAt[p]);
+    if (wait <= 0) midiSend([0x90 | LIGHT_CH, p, 1]);
+    else setTimeout(() => { if (midi.lit.get(p)) midiSend([0x90 | LIGHT_CH, p, 1]); }, wait);
+  }
+  function lightOff(p) {
+    const c = midi.lit.get(p) || 0;
+    if (c > 1) { midi.lit.set(p, c - 1); return; }
+    if (c === 1) { midiSend([0x80 | LIGHT_CH, p, 0]); midi.offAt[p] = performance.now(); }
+    midi.lit.delete(p);
+  }
+  function lightNote(n) {
+    if (!midi.out || n._lit) return;
+    n._lit = true; midi.notes.add(n);
+    lightOn(n.p);
+  }
+  function unlightNote(n) {
+    if (!n._lit) return;
+    n._lit = false; midi.notes.delete(n);
+    lightOff(n.p);
+  }
+  function lightsOut() {
+    for (const n of midi.notes) n._lit = false;
+    midi.notes.clear();
+    for (const p of midi.lit.keys()) midiSend([0x80 | LIGHT_CH, p, 0]);
+    midi.lit.clear();
+    midiSend([0xB0 | LIGHT_CH, 123, 0]);                         // alla toner av på lektionskanalen
+    midiSend([0xB0 | LIGHT_CH, 11, 0]);                          // uttryck 0 (igen, ifall pianot nollställt kanalen): tänder men låter inte
+  }
+  function midiBind() {
+    const acc = midi.access;
+    if (!acc) return 0;
+    const real = port => port.state !== 'disconnected' && !VIRTUAL.test(port.name || '');
+    const ins = [...acc.inputs.values()].filter(real);
+    for (const inp of ins) {
+      inp.onmidimessage = e => {
+        const [st, a, b] = e.data, type = st & 0xF0;
+        if (type === 0x90 && b > 0) userNoteOn(a, 'midi');
+        else if (type === 0x80 || (type === 0x90 && b === 0)) userNoteOff(a, 'midi');
       };
-      access.onstatechange = bind;
-      bind();
-    } catch (e) { toast('Fick inte tillgång till MIDI.'); }
-  });
+    }
+    const outs = [...acc.outputs.values()].filter(real);
+    const out = outs.find(o => /casio/i.test(o.name || '')) || outs.find(o => ins.some(i => i.name === o.name)) || null;
+    if ((out && out.id) !== (midi.out && midi.out.id)) {
+      lightsOut();
+      midi.out = out;
+      lightsOut();                                               // börja släckt och tyst på den nya porten
+    }
+    $('midiBtn').textContent = ins.length ? 'Klaviatur ansluten' : 'USB-klaviatur';
+    midi.name = ins.length ? (ins[0].name || 'USB-klaviatur') : '';
+    return ins.length;
+  }
+  async function midiConnect(quiet) {
+    try {
+      midi.access = await navigator.requestMIDIAccess();
+      midi.access.onstatechange = () => midiBind();
+      const n = midiBind();
+      if (n && mic.on) stopMic();                                // tangenttrycken kommer exakt via USB – mikrofonen skulle bara störa
+      if (!quiet || n) toast(n ? `Ansluten: ${midi.name}.` + (midi.out ? ' Tangenterna du ska spela tänds på klaviaturen.' : '') : 'Ingen USB-klaviatur hittades.');
+    } catch (e) { if (!quiet) toast('Fick inte tillgång till MIDI.'); }
+  }
+  if (navigator.requestMIDIAccess) {
+    $('midiBtn').hidden = false;
+    $('midiBtn').addEventListener('click', e => { midiConnect(false); e.currentTarget.blur(); });
+    // har du redan gett lov en gång ansluts klaviaturen av sig själv
+    try { navigator.permissions.query({ name: 'midi' }).then(st => { if (st.state === 'granted') midiConnect(true); }).catch(() => {}); } catch (e) { /* stöds inte */ }
+    // lämna pianot som det var: släck och låt lektionskanalen låta igen
+    window.addEventListener('pagehide', () => { lightsOut(); midiSend([0xB0 | LIGHT_CH, 11, 127]); });
+  }
+
+  // ---------- Röst som säger vilket finger ----------
+  const FINGER_SV = ['', 'ett', 'två', 'tre', 'fyra', 'fem'];
+  let sayTimer = 0;
+  function sayFingers(ev) {
+    // med mikrofonen på är rösten tyst: den skulle höras i mikrofonen och kunna tas för en ton
+    if (!S.speak || mic.on || !window.speechSynthesis) return;
+    const ns = ev.notes.filter(n => n.f).sort((a, b) => a.p - b.p).slice(0, 6);
+    if (!ns.length) return;
+    let voice = null;
+    try { voice = speechSynthesis.getVoices().find(v => /^sv/i.test(v.lang)) || null; } catch (e) { /* inga röster */ }
+    // finns ingen svensk röst sägs siffrorna på röstens eget språk
+    const part = h => ns.filter(n => n.h === h).map(n => voice ? FINGER_SV[n.f] : String(n.f)).join(', ');
+    const L = part('L'), R = part('R');
+    const both = S.hand === 'B';
+    const text = [L && (both ? (voice ? 'vänster ' : 'left ') : '') + L, R && (both ? (voice ? 'höger ' : 'right ') : '') + R].filter(Boolean).join('. ');
+    const u = new SpeechSynthesisUtterance(text);
+    if (voice) { u.voice = voice; u.lang = voice.lang; } else u.lang = 'en-US';
+    u.rate = 1.1;
+    if (speechSynthesis.speaking || speechSynthesis.pending) speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+  }
+  if (window.speechSynthesis) { try { speechSynthesis.getVoices(); } catch (e) { /* rösterna läses in i bakgrunden */ } }
 
   // ---------- Uppspelning ----------
   let t = -LEAD, playing = false, waiting = false;
@@ -331,10 +417,13 @@
       appPlayed[n.p] = performance.now();
       if (mic.det) mic.det.markOwnOnset(performance.now(), n.p);   // iPadens eget anslag får inte bevisa ett omslag av en släkt ton
     }
+    // tänd tangenten på klaviaturen för de toner du själv ska spela (i Lyssna-läget: alla)
+    if (S.mode === 'listen' || practiced(n.h)) lightNote(n);
     active.add(n);
   }
   function noteEnd(n) {
     if (n._voice) { synth.noteOff(n._voice); n._voice = null; }
+    unlightNote(n);
     active.delete(n);
   }
   function advance(to) {
@@ -345,6 +434,9 @@
   function stopAll() {
     [...active].forEach(noteEnd);
     synth.allOff();
+    lightsOut();
+    clearTimeout(sayTimer);
+    if (window.speechSynthesis) speechSynthesis.cancel();
   }
   function buildPractice() {
     practice = [];
@@ -425,8 +517,12 @@
     for (const p of ev.pitches) {
       if (pressId[p] > consumed[p] && now - pressTime[p] < PRE_WINDOW * 1000) { ev.got.add(p); consumed[p] = pressId[p]; }
     }
-    if (satisfied(ev)) completeEvent(ev);
-    else waiting = true;
+    if (satisfied(ev)) { completeEvent(ev); return; }
+    waiting = true;
+    ev.notes.forEach(lightNote);     // hela ackordet tänds, även toner som börjar en aning senare
+    // säg fingret om tonen inte kommit efter en liten stund (den som redan spelar behöver inte höra det)
+    clearTimeout(sayTimer);
+    sayTimer = setTimeout(() => { if (waiting && practice[pendIdx] === ev) sayFingers(ev); }, 400);
   }
   function checkMisses() {
     // med mikrofon: träffönstret (0,45 s) plus den längsta fördröjningen i igenkänningen (ett omslag, ca 0,45 s)
@@ -808,6 +904,7 @@
   bindChk('loopChk', 'loop', false);
   bindChk('fingerChk', 'fingers', false);
   bindChk('nameChk', 'names', false);
+  bindChk('speakChk', 'speak', false);
   bindChk('accompChk', 'accomp', true);
 
   const soundSel = $('soundSel');

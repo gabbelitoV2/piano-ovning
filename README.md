@@ -7,8 +7,18 @@ En övningsapp för piano som körs i webbläsaren, gjord för iPad på notstäl
 - **Spela i takt**: musiken går vidare och träffar räknas.
 - **Stäm av**: appen mäter hur ditt piano är stämt, så ett lite ostämt piano fungerar.
 - Öppna valfri MIDI-fil (.mid). Den sparas bara på din egen enhet. Ingen låt följer med sidan.
+- **USB-klaviatur** (Chrome/Edge på dator, Web MIDI): tangenttrycken läses direkt från ett digitalpiano, utan mikrofon.
+  Har klaviaturen tangenter som lyser (Casio LK-serien) tänds den tangent som ska spelas på själva klaviaturen.
+- **Säg finger**: en röst säger vilket finger (och vilken hand, när båda övas) när musiken väntar på dig.
 
 Öppna sidan i Safari på iPaden, tryck **Öppna låt** och sedan **Starta mikrofonen**.
+
+### Tangentljus på Casio LK
+
+En Casio LK tänder tangenten för varje ton den får på sin lektionskanal (kanal 4). Appen skickar tonerna dit med
+anslagsstyrka 1 och kanalens uttryck (CC 11) på 0: tangenten lyser men pianot låter inte. När sidan lämnas släcks allt
+och uttrycket sätts tillbaka till 127. Portar som inte är klaviaturer (Windows inbyggda synt, loopMIDI och liknande)
+hoppas över. Rösten är tyst när mikrofonen lyssnar, eftersom den annars skulle kunna tas för en ton.
 
 ## Filer
 
